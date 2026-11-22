@@ -94,7 +94,7 @@ function supports(model: ProviderModel, purpose: AiPurpose, provider: AiProvider
 
 /** Per-user encrypted provider connections and separate purpose assignments. */
 export class AiCredentialService {
-  constructor(private readonly db: Database, private readonly box: SecretBox, private readonly opts: { allowLocal: boolean; appUrl?: string }) {}
+  constructor(private readonly db: Database, private readonly box: SecretBox, private readonly opts: { allowLocal: boolean; appUrl?: string; requireApiKey?: boolean }) {}
 
   private async find(userId: string, provider: AiProvider) {
     const [row] = await this.db.select().from(aiCredential).where(and(eq(aiCredential.userId, userId), eq(aiCredential.provider, provider))).limit(1);
@@ -232,7 +232,9 @@ export class AiCredentialService {
 
   async set(userId: string, input: CredentialInput) {
     const apiKey = await this.keyFor(userId, input.provider, input.apiKey);
-    if (input.provider !== "openai-compatible" && !apiKey) throw new TRPCError({ code: "BAD_REQUEST", message: "Enter an API key" });
+    if ((input.provider !== "openai-compatible" || this.opts.requireApiKey) && !apiKey) {
+      throw new TRPCError({ code: "BAD_REQUEST", message: "Enter an API key. Hosted cloud AI requires a key from your provider." });
+    }
     if (input.apiKey && (input.apiKey.trim().length < 8 || input.apiKey.trim().length > 400)) throw new TRPCError({ code: "BAD_REQUEST", message: "That API key doesn't look right" });
     if (input.provider === "openai-compatible") {
       if (!input.baseUrl) throw new TRPCError({ code: "BAD_REQUEST", message: "Enter the server URL" });
@@ -259,6 +261,9 @@ export class AiCredentialService {
     const connection = await this.find(userId, input.provider);
     if (!connection) throw new TRPCError({ code: "NOT_FOUND", message: "Connect this provider before assigning it" });
     const apiKey = connection.encryptedKey ? this.box.open(connection.encryptedKey) : "";
+    if (this.opts.requireApiKey && !apiKey) {
+      throw new TRPCError({ code: "PRECONDITION_FAILED", message: "Hosted cloud AI requires your own provider API key. Add it in Settings → AI." });
+    }
     const models = await this.modelRequest(input.provider, connection.baseUrl ?? undefined, apiKey, input.purpose);
     const selected = models.find((model) => model.id === input.model);
     if (!selected || !supports(selected, input.purpose, input.provider)) {
@@ -288,6 +293,9 @@ export class AiCredentialService {
     const credential = await this.find(userId, assignment.provider);
     if (!credential) return null;
     const apiKey = credential.encryptedKey ? this.box.open(credential.encryptedKey) : "";
+    if (this.opts.requireApiKey && !apiKey) {
+      throw new TRPCError({ code: "PRECONDITION_FAILED", message: "Hosted cloud AI requires your own provider API key. Add it in Settings → AI." });
+    }
     if (assignment.provider === "openai-compatible" && credential.baseUrl) await assertPublicUrl(credential.baseUrl, this.opts);
     return { assignment, credential, apiKey };
   }

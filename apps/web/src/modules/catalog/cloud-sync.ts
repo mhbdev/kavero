@@ -96,16 +96,51 @@ async function pushNow(localId: string, userId: string, opts: { force?: boolean;
     const stored = await repo.getAsset(assetId);
     const meta = doc.assets.find((a) => a.id === assetId);
     if (stored && meta) {
-      const put = await fetch(`/api/catalogs/${target.id}/assets/${encodeURIComponent(assetId)}`, {
-        method: "PUT",
-        headers: { "Content-Type": meta.mimeType },
-        body: stored.blob,
+      const path = `/api/catalogs/${target.id}/assets/${encodeURIComponent(assetId)}`;
+      const prepared = await fetch(path, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ hash: meta.hash ?? stored.hash, bytes: stored.blob.size }),
         credentials: "include",
       }).catch((e: Error) => e);
-      if (put instanceof Error || !put.ok) {
+      if (prepared instanceof Error || !prepared.ok) {
         await setLink(pending);
-        const reason = put instanceof Error ? put.message : ((await put.json().catch(() => null))?.error ?? put.status);
+        const reason = prepared instanceof Error ? prepared.message : ((await prepared.json().catch(() => null))?.error ?? prepared.status);
         throw new Error(`Uploading ${meta.name} failed: ${reason}. It will be retried on the next sync.`);
+      }
+      const request = await prepared.json() as { direct?: boolean; uploadId?: string; uploadUrl?: string; uploadHeaders?: Record<string, string>; deduplicated?: boolean };
+      if (!request.deduplicated) {
+        if (request.direct && request.uploadUrl && request.uploadId) {
+          const transfer = await fetch(request.uploadUrl, { method: "PUT", headers: request.uploadHeaders, body: stored.blob }).catch((e: Error) => e);
+          if (transfer instanceof Error || !transfer.ok) {
+            await setLink(pending);
+            const reason = transfer instanceof Error ? transfer.message : `object storage returned ${transfer.status}`;
+            throw new Error(`Uploading ${meta.name} failed: ${reason}. It will be retried on the next sync.`);
+          }
+          const completed = await fetch(path, {
+            method: "PATCH",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ uploadId: request.uploadId }),
+            credentials: "include",
+          }).catch((e: Error) => e);
+          if (completed instanceof Error || !completed.ok) {
+            await setLink(pending);
+            const reason = completed instanceof Error ? completed.message : ((await completed.json().catch(() => null))?.error ?? completed.status);
+            throw new Error(`Verifying ${meta.name} failed: ${reason}. It will be retried on the next sync.`);
+          }
+        } else {
+          const put = await fetch(path, {
+            method: "PUT",
+            headers: { "Content-Type": meta.mimeType },
+            body: stored.blob,
+            credentials: "include",
+          }).catch((e: Error) => e);
+          if (put instanceof Error || !put.ok) {
+            await setLink(pending);
+            const reason = put instanceof Error ? put.message : ((await put.json().catch(() => null))?.error ?? put.status);
+            throw new Error(`Uploading ${meta.name} failed: ${reason}. It will be retried on the next sync.`);
+          }
+        }
       }
       uploaded++;
     }

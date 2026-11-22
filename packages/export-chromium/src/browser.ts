@@ -19,6 +19,16 @@ const CHROME_CANDIDATES = [
   "/usr/bin/chromium",
   "/usr/bin/chromium-browser",
 ];
+let serverlessChromium: Promise<{ executablePath: string; args: string[] } | null> | null = null;
+
+async function getServerlessChromium() {
+  if (process.env.VERCEL !== "1") return null;
+  serverlessChromium ??= (async () => {
+    const { default: chromium } = await import("@sparticuz/chromium");
+    return { executablePath: await chromium.executablePath(), args: chromium.args };
+  })();
+  return serverlessChromium;
+}
 
 /** Thrown when every Chrome slot stays busy for longer than the caller is willing to wait. */
 export class BrowserBusyError extends Error {
@@ -83,13 +93,19 @@ export function isBrowserClosedError(error: unknown): boolean {
 }
 
 export async function launchBrowser(opts: { queueTimeoutMs?: number } = {}): Promise<Browser> {
-  const executablePath = CHROME_CANDIDATES.find((p) => p && existsSync(p));
+  const localExecutable = CHROME_CANDIDATES.find((p) => p && existsSync(p));
+  const serverless = localExecutable ? null : await getServerlessChromium();
+  const executablePath = localExecutable ?? serverless?.executablePath;
   if (!executablePath) {
     throw new Error("No Chrome or Chromium found. Install Chrome or set KAVERO_CHROME_PATH.");
   }
   const release = await acquireSlot(opts.queueTimeoutMs ?? 30_000);
   try {
-    const browser = await chromium.launch({ executablePath, headless: true, args: ["--disable-gpu", "--font-render-hinting=none", "--dns-prefetch-disable", "--disable-dev-shm-usage"] });
+    const browser = await chromium.launch({
+      executablePath,
+      headless: true,
+      args: [...(serverless?.args ?? []), "--disable-gpu", "--font-render-hinting=none", "--dns-prefetch-disable", "--disable-dev-shm-usage"],
+    });
     browser.on("disconnected", release);
     return browser;
   } catch (e) {

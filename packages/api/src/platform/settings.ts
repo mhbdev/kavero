@@ -49,6 +49,7 @@ export const SETTINGS: readonly SectionDef[] = [
       { key: "bucket", label: "Bucket", type: "string", env: "S3_BUCKET", when: s3, placeholder: "kavero-media" },
       { key: "region", label: "Region", type: "string", env: "S3_REGION", when: s3, description: "Use \"auto\" for Cloudflare R2. Defaults to us-east-1, or auto when an endpoint is set.", placeholder: "us-east-1" },
       { key: "endpoint", label: "Endpoint", type: "url", env: "S3_ENDPOINT", when: s3, description: "Only for R2, MinIO and other non-AWS services.", placeholder: "https://<account>.r2.cloudflarestorage.com" },
+      { key: "publicEndpoint", label: "Public signing endpoint", type: "url", env: "S3_PUBLIC_ENDPOINT", when: s3, description: "Optional browser-reachable endpoint for signed transfers when the server uses a private S3 endpoint." },
       { key: "accessKeyId", label: "Access key ID", type: "string", env: "S3_ACCESS_KEY_ID", when: s3, description: "Leave empty to use the server's own credentials (IAM role, AWS profile)." },
       { key: "secretAccessKey", label: "Secret access key", type: "secret", env: "S3_SECRET_ACCESS_KEY", when: s3 },
       { key: "forcePathStyle", label: "Path-style URLs", type: "boolean", env: "S3_FORCE_PATH_STYLE", default: false, when: s3, description: "Needed for MinIO." },
@@ -57,7 +58,8 @@ export const SETTINGS: readonly SectionDef[] = [
   {
     id: "ai",
     title: "AI model",
-    description: "The server-wide model everyone can use. Users can still add their own key in Settings → AI. Without a model, Kavero's built-in planner is used.",
+    description: "The server-wide model for self-hosted deployments. Cloud users bring their own keys in Settings → AI.",
+    editions: ["desktop", "self-hosted"],
     fields: [
       {
         key: "provider", label: "Provider", type: "enum", env: "AI_PROVIDER", default: "auto",
@@ -127,14 +129,14 @@ export const SETTINGS: readonly SectionDef[] = [
   {
     id: "plans",
     title: "Plan limits",
-    description: "Default limits for every account. Leave a field empty for no limit.",
+    description: "Default limits for each workspace. Leave a field empty for no limit.",
     editions: ["cloud"],
     fields: [
       { key: "planName", label: "Plan name", type: "string", default: "Free" },
-      { key: "maxCatalogs", label: "Cloud catalogs per user", type: "number", min: 1, max: 100_000 },
-      { key: "maxPublishedSites", label: "Published sites per user", type: "number", min: 0, max: 100_000 },
-      { key: "maxStorageMb", label: "Storage per user (MB)", type: "number", min: 1, max: 10_000_000 },
-      { key: "aiRequestsPerDay", label: "AI requests per user per day", type: "number", min: 0, max: 1_000_000 },
+      { key: "maxCatalogs", label: "Cloud catalogs per workspace", type: "number", min: 1, max: 100_000 },
+      { key: "maxPublishedSites", label: "Published sites per workspace", type: "number", min: 0, max: 100_000 },
+      { key: "maxStorageMb", label: "Storage per workspace (MB)", type: "number", min: 1, max: 10_000_000 },
+      { key: "aiRequestsPerDay", label: "AI requests per workspace per day", type: "number", min: 0, max: 1_000_000 },
     ],
   },
 ];

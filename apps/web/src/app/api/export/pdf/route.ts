@@ -1,10 +1,11 @@
-import { attachmentHeader, parseCatalogDocument, safeFileName } from "@Kavero/catalog-engine";
+import { parseCatalogDocument, safeFileName } from "@Kavero/catalog-engine";
 import { renderPdf } from "@Kavero/export-chromium";
 import { z } from "zod";
 
-import { auditExport, canExport, exportAssetsSchema, exportFailed, readExportBody, renderOrigin } from "@/modules/export/access";
+import { auditExport, canExport, exportAssetsSchema, exportDownloadResponse, exportFailed, readExportBody, renderOrigin } from "@/modules/export/access";
 
 export const runtime = "nodejs";
+export const maxDuration = 300;
 
 const bodySchema = z.object({
   document: z.unknown(),
@@ -28,10 +29,9 @@ export async function POST(request: Request) {
 
   try {
     const pdf = await renderPdf({ doc: doc.document, assets: { ...parsed.data.assets, ...read.files }, baseUrl: renderOrigin(request), pageNumbers: parsed.data.pageNumbers });
-    await auditExport(request, "pdf", doc.document.metadata.title, "ok", { slides: doc.document.slides.length });
-    return new Response(new Blob([pdf as BlobPart], { type: "application/pdf" }), {
-      headers: { "Content-Disposition": attachmentHeader(safeFileName(doc.document.metadata.title, "pdf")), "Cache-Control": "no-store" },
-    });
+    const response = await exportDownloadResponse(pdf, "application/pdf", safeFileName(doc.document.metadata.title, "pdf"));
+    await auditExport(request, "pdf", doc.document.metadata.title, response.ok ? "ok" : "error", { slides: doc.document.slides.length });
+    return response;
   } catch (e) {
     await auditExport(request, "pdf", doc.document.metadata.title, "error", { slides: doc.document.slides.length });
     return exportFailed(e, "PDF export");

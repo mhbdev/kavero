@@ -6,11 +6,12 @@ import type { NextConfig } from "next";
 const nextConfig: NextConfig = {
   typedRoutes: true,
   reactCompiler: true,
-  output: "standalone",
+  // Vercel builds its own function bundles; standalone is for Docker/self-hosting.
+  ...(process.env.VERCEL ? {} : { output: "standalone" as const }),
   transpilePackages: ["@Kavero/catalog-engine", "@Kavero/local-storage", "@Kavero/editor-core", "@Kavero/renderer", "@Kavero/animation-engine", "@Kavero/export-chromium", "@Kavero/export-pptx", "@Kavero/mcp-server", "@Kavero/ai"],
   // Native/binary packages used by video export must stay outside the bundle.
   // PGlite (the desktop app's embedded database) loads its WebAssembly and data files at runtime.
-  serverExternalPackages: ["playwright-core", "@ffmpeg-installer/ffmpeg", "@electric-sql/pglite"],
+  serverExternalPackages: ["playwright-core", "@ffmpeg-installer/ffmpeg", "@electric-sql/pglite", "@sparticuz/chromium"],
   // Keep build-only / dev-only packages out of the standalone output (which the desktop
   // app ships as resources/web). Globs are resolved from apps/web; "../../node_modules"
   // is the monorepo root, where bun keeps its store (node_modules/.bun/<pkg@ver>/...).

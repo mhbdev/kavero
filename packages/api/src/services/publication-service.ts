@@ -6,11 +6,14 @@ import type { Database } from "@Kavero/db";
 import { user } from "@Kavero/db/schema/auth";
 import { catalogAsset } from "@Kavero/db/schema/catalog";
 import { publication, publicationAsset, publicationViewDaily } from "@Kavero/db/schema/publication";
+import { workspace } from "@Kavero/db/schema/workspace";
 import { TRPCError } from "@trpc/server";
 import { and, eq, gte, ne, sql } from "drizzle-orm";
 
 import { isUniqueViolation, requireCatalog, type CatalogPermission } from "./access";
 import { isBanned } from "./audit-service";
+import { quotaFor } from "../platform/quota";
+import type { Platform } from "../platform/edition";
 
 const scrypt = promisify(scryptCb) as (pw: string, salt: Buffer, len: number) => Promise<Buffer>;
 
@@ -62,7 +65,7 @@ export interface PublishInput {
  * ownership; public methods only ever return what a visitor may see.
  */
 export class PublicationService {
-  constructor(private readonly db: Database) {}
+  constructor(private readonly db: Database, private readonly platform?: Platform) {}
 
   private async ownedCatalog(userId: string, catalogId: string, need: CatalogPermission = "publish") {
     try {
@@ -114,40 +117,52 @@ export class PublicationService {
   /** Snapshot the current cloud catalog and make it live (creating or replacing the publication). */
   async publish(userId: string, input: PublishInput) {
     const cat = await this.ownedCatalog(userId, input.catalogId);
+    if (!cat.workspaceId) throw new TRPCError({ code: "PRECONDITION_FAILED", message: "Move this catalog into a workspace before publishing it." });
     const slugCheck = await this.isSlugAvailable(userId, cat.id, input.slug);
     if (!slugCheck.available) throw new TRPCError({ code: "BAD_REQUEST", message: slugCheck.reason ?? "Invalid address" });
 
-    const parsed = parseCatalogDocument(cat.document);
-    if (!parsed.ok) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: "Stored catalog is invalid" });
-    const doc: CatalogDocument = parsed.document;
-
-    const files = await this.db.select().from(catalogAsset).where(eq(catalogAsset.catalogId, cat.id));
-    const byId = new Map(files.map((f) => [f.assetId, f]));
-    const missing = doc.assets.filter((a) => !/^https:\/\//i.test(a.uri) && !byId.has(a.id)).map((a) => a.name);
-
-    const [existing] = await this.db.select({ id: publication.id, version: publication.version, passwordHash: publication.passwordHash }).from(publication).where(eq(publication.catalogId, cat.id)).limit(1);
-
-    let passwordHash: string | null = null;
+    let suppliedPasswordHash: string | null = null;
     if (input.visibility === "password") {
       if (input.password) {
         if (input.password.length < MIN_PASSWORD_LENGTH) throw new TRPCError({ code: "BAD_REQUEST", message: `Use a password of at least ${MIN_PASSWORD_LENGTH} characters` });
-        passwordHash = await hashPassword(input.password);
-      } else if (existing?.passwordHash) passwordHash = existing.passwordHash;
-      else throw new TRPCError({ code: "BAD_REQUEST", message: "Set a password for this catalog" });
+        suppliedPasswordHash = await hashPassword(input.password);
+      }
     }
 
-    const values = {
-      slug: input.slug, visibility: input.visibility, passwordHash, sourceRevision: cat.revision, document: doc,
-      seoTitle: input.seoTitle?.trim().slice(0, 120) || null, seoDescription: input.seoDescription?.trim().slice(0, 300) || null,
-      ogImageKey: null, publishedAt: new Date(),
-    };
+    const result = await this.db.transaction(async (tx) => {
+      // Serialize publication pins with workspace asset cleanup and other asset
+      // attachments. Re-read the catalog and its assets after taking the lock.
+      const [lockedWorkspace] = await tx.select({ id: workspace.id }).from(workspace).where(eq(workspace.id, cat.workspaceId!)).for("update");
+      if (!lockedWorkspace) throw new TRPCError({ code: "NOT_FOUND", message: "Workspace not found." });
+      const { row: currentCatalog } = await requireCatalog(tx as unknown as Database, userId, cat.id, "publish", { forUpdate: true });
+      if (currentCatalog.workspaceId !== cat.workspaceId) throw new TRPCError({ code: "CONFLICT", message: "The catalog moved to another workspace. Try publishing it again." });
+      await quotaFor({ db: tx as unknown as Database, platform: this.platform }).assertCanPublish(userId, cat.id);
 
-    const id = await this.db.transaction(async (tx) => {
+      const parsed = parseCatalogDocument(currentCatalog.document);
+      if (!parsed.ok) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: "Stored catalog is invalid" });
+      const doc: CatalogDocument = parsed.document;
+      const files = await tx.select().from(catalogAsset).where(eq(catalogAsset.catalogId, cat.id));
+      const byId = new Map(files.map((f) => [f.assetId, f]));
+      const missing = doc.assets.filter((a) => !/^https:\/\//i.test(a.uri) && !byId.has(a.id)).map((a) => a.name);
+      const [existing] = await tx.select({ id: publication.id, version: publication.version, passwordHash: publication.passwordHash }).from(publication).where(eq(publication.catalogId, cat.id)).limit(1);
+      let passwordHash: string | null = null;
+      if (input.visibility === "password") {
+        if (suppliedPasswordHash) passwordHash = suppliedPasswordHash;
+        else if (existing?.passwordHash) passwordHash = existing.passwordHash;
+        else throw new TRPCError({ code: "BAD_REQUEST", message: "Set a password for this catalog" });
+      }
+      const values = {
+        slug: input.slug, visibility: input.visibility, passwordHash, sourceRevision: currentCatalog.revision, document: doc,
+        seoTitle: input.seoTitle?.trim().slice(0, 120) || null, seoDescription: input.seoDescription?.trim().slice(0, 300) || null,
+        ogImageKey: null, publishedAt: new Date(),
+      };
+
       let pubId: string;
+      const version = (existing?.version ?? 0) + 1;
       if (existing) {
         pubId = existing.id;
         // ownerId follows the latest publisher (it decides e.g. whether a suspended account's site is offline).
-        await tx.update(publication).set({ ...values, ownerId: userId, version: existing.version + 1 }).where(eq(publication.id, existing.id));
+        await tx.update(publication).set({ ...values, ownerId: userId, version }).where(eq(publication.id, existing.id));
         await tx.delete(publicationAsset).where(eq(publicationAsset.publicationId, pubId));
       } else {
         pubId = randomUUID();
@@ -155,16 +170,16 @@ export class PublicationService {
       }
       const pinned = doc.assets.map((a) => byId.get(a.id)).filter((f) => !!f);
       if (pinned.length) {
-        await tx.insert(publicationAsset).values(pinned.map((f) => ({ id: randomUUID(), publicationId: pubId, assetId: f.assetId, mimeType: f.mimeType, storageKey: f.storageKey })));
+        await tx.insert(publicationAsset).values(pinned.map((f) => ({ id: randomUUID(), publicationId: pubId, assetId: f.assetId, mimeType: f.mimeType, storageKey: f.storageKey, hash: f.hash, bytes: f.bytes })));
       }
-      return pubId;
+      return { id: pubId, version, missingFiles: missing };
     }).catch((e) => {
       // Another publish took the address (or published this catalog) in the meantime.
       if (isUniqueViolation(e)) throw new TRPCError({ code: "CONFLICT", message: "That address was just taken, or this catalog was published from somewhere else. Try again." });
       throw e;
     });
 
-    return { id, slug: input.slug, version: (existing?.version ?? 0) + 1, missingFiles: missing };
+    return { ...result, slug: input.slug };
   }
 
   async unpublish(userId: string, catalogId: string) {

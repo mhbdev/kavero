@@ -15,6 +15,7 @@ import {
   type CatalogElement,
 } from "@Kavero/catalog-engine";
 import type { Database } from "@Kavero/db";
+import type { Platform } from "@Kavero/api/platform/edition";
 import type { EditorCommand, NewElement } from "@Kavero/editor-core";
 import type { LlmProvider } from "@Kavero/ai";
 import { exportPptx } from "@Kavero/export-pptx";
@@ -47,6 +48,8 @@ export interface McpHost {
   loadAssets?: (doc: CatalogDocument) => Promise<Record<string, string>>;
   /** Remove stored files (storage keys) of a deleted catalog. Optional. */
   deleteObjects?: (storageKeys: string[]) => Promise<void>;
+  /** Edition and workspace entitlements for cloud MCP operations. */
+  platform?: Platform;
   /**
    * Store a font file in a cloud catalog, from a public https URL (SSRF-protected,
    * <= 15 MB) or raw bytes. The file type is checked from its contents. Optional.
@@ -158,8 +161,8 @@ export function fontSummary(doc: CatalogDocument) {
  */
 export function createKaveroMcpServer({ db, principal, host }: Ctx) {
   const server = new McpServer({ name: "kavero", version: "0.1.0" }, { instructions: "Create and edit Kavero product catalogs: slides with text, images, products, shapes, markdown, tables and HTML; themes, transitions, animations; previews and website publishing. Call catalog_get first to see ids and page size." });
-  const catalogs = new CatalogService(db, host.deleteObjects);
-  const pubs = new PublicationService(db);
+  const catalogs = new CatalogService(db, host.deleteObjects, host.platform);
+  const pubs = new PublicationService(db, host.platform);
   const uid = principal.userId;
 
   /** Scope check + audit + error mapping around every tool. */

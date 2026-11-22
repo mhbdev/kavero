@@ -17,6 +17,9 @@ const bodySchema = z.object({
 const MAX_DURATION_MS = 10 * 60 * 1000;
 
 export async function POST(request: Request) {
+  if (process.env.VERCEL === "1") {
+    return Response.json({ error: "MP4 export is unavailable on Vercel because export jobs need a persistent worker. Run the web app on a long-lived container host to enable video exports." }, { status: 503 });
+  }
   if (!(await canExport(request))) {
     return Response.json({ error: "Sign in to export video from a hosted server." }, { status: 401 });
   }

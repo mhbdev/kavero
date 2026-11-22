@@ -1,5 +1,5 @@
 import { defineRelationsPart } from "drizzle-orm";
-import { date, index, integer, jsonb, pgTable, primaryKey, text, timestamp, uniqueIndex } from "drizzle-orm/pg-core";
+import { bigint, date, index, integer, jsonb, pgTable, primaryKey, text, timestamp, uniqueIndex } from "drizzle-orm/pg-core";
 
 import { user } from "./auth";
 import { catalog } from "./catalog";
@@ -48,6 +48,8 @@ export const publicationAsset = pgTable(
     assetId: text("asset_id").notNull(),
     mimeType: text("mime_type").notNull(),
     storageKey: text("storage_key").notNull(),
+    hash: text("hash").notNull(),
+    bytes: bigint("bytes", { mode: "number" }).notNull().default(0),
   },
   (t) => [uniqueIndex("publication_asset_pub_asset_idx").on(t.publicationId, t.assetId)],
 );

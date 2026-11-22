@@ -1,7 +1,8 @@
-import { defineRelationsPart } from "drizzle-orm";
-import { foreignKey, index, integer, jsonb, pgTable, primaryKey, text, timestamp } from "drizzle-orm/pg-core";
+import { defineRelationsPart, sql } from "drizzle-orm";
+import { check, foreignKey, index, integer, jsonb, pgTable, primaryKey, text, timestamp } from "drizzle-orm/pg-core";
 
 import { user } from "./auth";
+import { workspace } from "./workspace";
 
 export type ModelCapabilities = {
   inputModalities: ("text" | "image" | "audio" | "video" | "file")[] | null;
@@ -89,6 +90,47 @@ export const aiJob = pgTable(
     createdAt: timestamp("created_at").defaultNow().notNull(),
   },
   (t) => [index("ai_job_user_created_idx").on(t.userId, t.createdAt)],
+);
+
+/** Durable image/video work. Queue messages contain only this row's id; keys stay encrypted in ai_credential. */
+export const mediaJob = pgTable(
+  "media_job",
+  {
+    id: text("id").primaryKey(),
+    userId: text("user_id").notNull().references(() => user.id, { onDelete: "cascade" }),
+    workspaceId: text("workspace_id").notNull().references(() => workspace.id, { onDelete: "cascade" }),
+    purpose: text("purpose", { enum: ["image", "video"] }).notNull(),
+    prompt: text("prompt").notNull(),
+    aspectRatio: text("aspect_ratio").notNull(),
+    provider: text("provider", { enum: ["anthropic", "openrouter", "openai", "openai-compatible", "google", "ai-gateway"] }).notNull(),
+    model: text("model").notNull(),
+    status: text("status", { enum: ["queued", "generating", "done", "error"] }).notNull().default("queued"),
+    storageKey: text("storage_key"),
+    posterStorageKey: text("poster_storage_key"),
+    gifStorageKey: text("gif_storage_key"),
+    mimeType: text("mime_type"),
+    bytes: integer("bytes"),
+    /** Actual persisted bytes, or a bounded reservation while queued/generating. */
+    storageBytes: integer("storage_bytes").notNull().default(0),
+    error: text("error"),
+    attempts: integer("attempts").notNull().default(0),
+    startedAt: timestamp("started_at"),
+    leaseUntil: timestamp("lease_until"),
+    expiresAt: timestamp("expires_at"),
+    createdAt: timestamp("created_at").defaultNow().notNull(),
+    updatedAt: timestamp("updated_at").defaultNow().$onUpdate(() => new Date()).notNull(),
+  },
+  (t) => [
+    index("media_job_user_created_idx").on(t.userId, t.createdAt),
+    index("media_job_workspace_status_idx").on(t.workspaceId, t.status),
+    index("media_job_expiry_idx").on(t.expiresAt),
+    check("media_job_purpose_check", sql`${t.purpose} in ('image', 'video')`),
+    check("media_job_status_check", sql`${t.status} in ('queued', 'generating', 'done', 'error')`),
+    check("media_job_provider_check", sql`${t.provider} in ('anthropic', 'openrouter', 'openai', 'openai-compatible', 'google', 'ai-gateway')`),
+    check("media_job_bytes_check", sql`${t.bytes} is null or ${t.bytes} between 0 and 26214400`),
+    check("media_job_storage_bytes_check", sql`${t.storageBytes} between 0 and 78643200`),
+    check("media_job_attempts_check", sql`${t.attempts} between 0 and 3`),
+  ],
 );
 
 /** A user's encrypted provider connection. Model choices live in aiModelAssignment. */

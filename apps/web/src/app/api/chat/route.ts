@@ -10,12 +10,16 @@ import {
   sanitizeChatMessages,
 } from "@Kavero/api/services/chat-message-utils";
 import { AiService } from "@Kavero/api/services/ai-service";
+import { requireCatalog } from "@Kavero/api/services/access";
 import { quotaFor } from "@Kavero/api/platform/quota";
 import { audit } from "@Kavero/api/services/audit-service";
 import type { LlmProvider } from "@Kavero/ai";
 import { PAGE_PRESETS, TEMPLATES, parseCatalogDocument, productSchema, type CatalogDocument } from "@Kavero/catalog-engine";
+import { ensurePersonalWorkspace } from "@Kavero/db/personal-workspace";
+import { catalog } from "@Kavero/db/schema/catalog";
 import { outline } from "@Kavero/mcp-server";
 import { createResilientRateLimiter } from "@Kavero/redis";
+import { eq } from "drizzle-orm";
 import {
   convertToModelMessages,
   createIdGenerator,
@@ -38,7 +42,8 @@ import { startMediaJob } from "@/modules/ai/media-jobs";
 
 export const runtime = "nodejs";
 // Long agent turns (many tool calls) are allowed outside the cloud edition; see turnBudgetMs.
-export const maxDuration = 1800;
+// Cloud turns are capped at 270s and need 30s of response/save margin.
+export const maxDuration = 300;
 
 /** Model + tools must finish inside this budget, leaving time to save the turn before the function is stopped. */
 const CLOUD_TURN_BUDGET_MS = 270_000;
@@ -57,7 +62,7 @@ const chatStore = new ChatConversationService(db);
 
 // Chat turns per user per minute (each can also run a generation or an edit, which have their own limit).
 const LIMIT = 20;
-const chatRateLimiter = createResilientRateLimiter({ namespace: "chat", maxRequests: LIMIT, windowMs: 60_000 });
+const chatRateLimiter = createResilientRateLimiter({ namespace: "chat", maxRequests: LIMIT, windowMs: 60_000, fallbackMode: platform.edition === "cloud" ? "error" : "local" });
 
 const idSchema = z.string().min(1).max(120).regex(/^[A-Za-z0-9_-]+$/);
 
@@ -116,6 +121,22 @@ function requestScope(url: URL) {
   const parsed = scopeSchema.safeParse({ mode: url.searchParams.get("mode"), scopeId: url.searchParams.get("scopeId") });
   if (!parsed.success || (parsed.data.mode === "landing" && parsed.data.scopeId !== "landing")) return null;
   return parsed.data;
+}
+
+async function resolveCatalogWorkspace(userId: string, documentId: string) {
+  try {
+    const { row } = await requireCatalog(db, userId, documentId, "read", { byDocumentId: true });
+    return row.workspaceId ?? (await ensurePersonalWorkspace(db, userId)).id;
+  } catch (error) {
+    const isNotFound = !!error && typeof error === "object" && "code" in error && error.code === "NOT_FOUND";
+    if (!isNotFound) throw error;
+
+    // A missing cloud copy is expected for a browser-only catalog. If the id exists in the cloud,
+    // however, don't let a caller use another workspace's document as a local-only chat scope.
+    const [existing] = await db.select({ id: catalog.id }).from(catalog).where(eq(catalog.documentId, documentId)).limit(1);
+    if (existing) throw error;
+    return (await ensurePersonalWorkspace(db, userId)).id;
+  }
 }
 
 const noStore = { "Cache-Control": "private, no-store" };
@@ -221,6 +242,19 @@ export async function POST(request: Request) {
     return fail(400, "Invalid landing chat scope.");
   }
 
+  // Catalog chats and media jobs inherit the workspace of a synced catalog. A local-only catalog
+  // has no cloud row yet, so it uses the user's personal workspace until it is synced.
+  let aiWorkspaceId: string;
+  try {
+    aiWorkspaceId = mode === "editor"
+      ? await resolveCatalogWorkspace(userId, scopeId)
+      : (await ensurePersonalWorkspace(db, userId)).id;
+  } catch (error) {
+    if (error instanceof Error && "code" in error && error.code === "NOT_FOUND") return notFound();
+    console.error("Chat workspace couldn't be resolved", error);
+    return fail(503, "The workspace couldn't be verified right now.");
+  }
+
   let stored: Awaited<ReturnType<ChatConversationService["load"]>>;
   try {
     stored = await chatStore.load(userId, mode, scopeId, conversationId);
@@ -235,11 +269,17 @@ export async function POST(request: Request) {
   }
 
   // Count only requests that will actually run a model turn (not malformed or conflicting ones).
-  if (!(await chatRateLimiter.limit(userId)).allowed) return fail(429, "Too many messages — wait a minute and try again.");
+  let chatLimit;
+  try {
+    chatLimit = await chatRateLimiter.limit(userId);
+  } catch {
+    return fail(503, "Chat is temporarily unavailable. Try again shortly.");
+  }
+  if (!chatLimit.allowed) return fail(429, "Too many messages — wait a minute and try again.");
 
   let personal: LlmProvider | null;
   try {
-    personal = await new AiCredentialService(db, secretBox, { allowLocal: await allowPrivateUrls(), appUrl: ENV.BETTER_AUTH_URL }).provider(userId);
+    personal = await new AiCredentialService(db, secretBox, { allowLocal: await allowPrivateUrls(), appUrl: ENV.BETTER_AUTH_URL, requireApiKey: platform.edition === "cloud" }).provider(userId);
   } catch (error) {
     // A saved personal key that can't be used must not silently fall back to the operator's key.
     console.error("Personal AI credential couldn't be loaded", error instanceof Error ? error.message : error);
@@ -251,7 +291,7 @@ export async function POST(request: Request) {
   // Plan limits (cloud edition) count turns on the server's model; a personal key is the user's own bill.
   if (!personal) {
     try {
-      await quotaFor({ db, platform }).consumeAiRequest(userId);
+      await quotaFor({ db, platform }).consumeAiRequest(aiWorkspaceId);
     } catch (error) {
       return fail(403, error instanceof Error ? error.message : "AI limit reached", "plan_limit");
     }
@@ -261,7 +301,7 @@ export async function POST(request: Request) {
   const turnDeadline = Date.now() + turnBudgetMs();
   const tools: ToolSet = mode === "landing"
     ? landingTools(ai, userId, turnDeadline)
-    : editorTools(ai, userId, doc!, context?.document, context?.slideId, turnDeadline);
+    : editorTools(ai, userId, doc!, context?.document, context?.slideId, turnDeadline, userId, aiWorkspaceId);
 
   const storedMessages = stored.exists ? await recoverChatMessages(stored.messages, tools) : [];
   const history = mergeChatMessages(storedMessages, [userMessage as UIMessage]);
@@ -498,6 +538,7 @@ function editorTools(
   currentSlideId: string | undefined,
   turnDeadline: number,
   mediaUserId = userId,
+  workspaceId?: string,
 ) {
   let calls = 0;
   return {
@@ -539,10 +580,10 @@ function editorTools(
       }),
       execute: async ({ purpose, prompt }) => {
         try {
-          const connection = await new AiCredentialService(db, secretBox, { allowLocal: process.env.NODE_ENV !== "production", appUrl: ENV.BETTER_AUTH_URL }).mediaCredential(mediaUserId ?? userId, purpose);
+          const connection = await new AiCredentialService(db, secretBox, { allowLocal: process.env.NODE_ENV !== "production", appUrl: ENV.BETTER_AUTH_URL, requireApiKey: platform.edition === "cloud" }).mediaCredential(mediaUserId ?? userId, purpose);
           const divisor = greatestCommonDivisor(doc.settings.width, doc.settings.height);
           const ratio = `${Math.max(1, Math.round(doc.settings.width / divisor))}:${Math.max(1, Math.round(doc.settings.height / divisor))}`;
-          const job = await startMediaJob({ userId: mediaUserId ?? userId, purpose, prompt, ...connection, aspectRatio: ratio });
+          const job = await startMediaJob({ userId: mediaUserId ?? userId, purpose, prompt, provider: connection.provider, model: connection.model, aspectRatio: ratio, workspaceId });
           return { jobId: job.id, purpose, prompt, status: job.status };
         } catch (error) {
           return { error: error instanceof Error ? error.message : "Media generation could not be started." };

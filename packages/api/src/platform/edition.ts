@@ -43,10 +43,10 @@ export const UNLIMITED: Entitlements = { plan: "unlimited", maxCatalogs: null, m
 
 /** Source of a user's limits. Self-hosted and desktop use the unlimited default; cloud plugs in plans. */
 export interface EntitlementProvider {
-  forUser(userId: string): Promise<Entitlements>;
+  forWorkspace(workspaceId: string): Promise<Entitlements>;
 }
 
-export const unlimitedEntitlements: EntitlementProvider = { forUser: async () => UNLIMITED };
+export const unlimitedEntitlements: EntitlementProvider = { forWorkspace: async () => UNLIMITED };
 
 /** Optional, edition-specific features. Core features are always on and not listed here. */
 export interface EditionFeatures {
@@ -63,7 +63,7 @@ export interface EditionFeatures {
 export const EDITION_FEATURES: Record<Edition, EditionFeatures> = {
   desktop: { accounts: false, billing: false, privateNetworkByDefault: true, selfUpdate: true },
   "self-hosted": { accounts: true, billing: false, privateNetworkByDefault: false, selfUpdate: false },
-  cloud: { accounts: true, billing: true, privateNetworkByDefault: false, selfUpdate: false },
+  cloud: { accounts: true, billing: false, privateNetworkByDefault: false, selfUpdate: false },
 };
 
 /**

@@ -1,5 +1,5 @@
-import { defineRelationsPart } from "drizzle-orm";
-import { bigint, index, integer, jsonb, pgTable, text, timestamp, uniqueIndex } from "drizzle-orm/pg-core";
+import { defineRelationsPart, sql } from "drizzle-orm";
+import { bigint, check, index, integer, jsonb, pgTable, text, timestamp, uniqueIndex } from "drizzle-orm/pg-core";
 
 import { user } from "./auth";
 import { workspace } from "./workspace";
@@ -64,12 +64,39 @@ export const catalogAsset = pgTable(
   (t) => [uniqueIndex("catalog_asset_catalog_asset_idx").on(t.catalogId, t.assetId)],
 );
 
-export const catalogRelations = defineRelationsPart({ user, catalog, catalogRevision, catalogAsset }, (r) => ({
+/** Short-lived authorization and quota reservation for a direct object-storage upload. */
+export const catalogUpload = pgTable(
+  "catalog_upload",
+  {
+    id: text("id").primaryKey(),
+    catalogId: text("catalog_id").notNull().references(() => catalog.id, { onDelete: "cascade" }),
+    userId: text("user_id").notNull().references(() => user.id, { onDelete: "cascade" }),
+    workspaceId: text("workspace_id").notNull().references(() => workspace.id, { onDelete: "cascade" }),
+    assetId: text("asset_id").notNull(),
+    mimeType: text("mime_type").notNull(),
+    bytes: bigint("bytes", { mode: "number" }).notNull(),
+    hash: text("hash").notNull(),
+    storageKey: text("storage_key").notNull(),
+    expiresAt: timestamp("expires_at").notNull(),
+    completedAt: timestamp("completed_at"),
+    createdAt: timestamp("created_at").defaultNow().notNull(),
+  },
+  (t) => [
+    index("catalog_upload_workspace_expiry_idx").on(t.workspaceId, t.expiresAt),
+    index("catalog_upload_user_idx").on(t.userId, t.createdAt),
+    check("catalog_upload_bytes_check", sql`${t.bytes} between 1 and 26214400`),
+    check("catalog_upload_hash_check", sql`${t.hash} ~ '^[a-f0-9]{64}$'`),
+  ],
+);
+
+export const catalogRelations = defineRelationsPart({ user, catalog, catalogRevision, catalogAsset, catalogUpload }, (r) => ({
   catalog: {
     owner: r.one.user({ from: r.catalog.ownerId, to: r.user.id }),
     revisions: r.many.catalogRevision({ from: r.catalog.id, to: r.catalogRevision.catalogId }),
     assets: r.many.catalogAsset({ from: r.catalog.id, to: r.catalogAsset.catalogId }),
+    uploads: r.many.catalogUpload({ from: r.catalog.id, to: r.catalogUpload.catalogId }),
   },
   catalogRevision: { catalog: r.one.catalog({ from: r.catalogRevision.catalogId, to: r.catalog.id }) },
   catalogAsset: { catalog: r.one.catalog({ from: r.catalogAsset.catalogId, to: r.catalog.id }) },
+  catalogUpload: { catalog: r.one.catalog({ from: r.catalogUpload.catalogId, to: r.catalog.id }) },
 }));

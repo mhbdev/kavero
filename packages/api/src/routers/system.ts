@@ -5,6 +5,8 @@ import { adminProcedure, publicProcedure, router } from "../index";
 import type { Context } from "../context";
 import { SETTINGS } from "../platform/settings";
 import { audit } from "../services/audit-service";
+import { ensurePersonalWorkspace } from "@Kavero/db/personal-workspace";
+import { workspaceRole } from "../services/access";
 
 function requireConfig(ctx: Context) {
   if (!ctx.config) throw new TRPCError({ code: "PRECONDITION_FAILED", message: "Runtime settings aren't available on this server" });
@@ -31,10 +33,12 @@ export const systemRouter = router({
     };
   }),
 
-  /** The signed-in user's plan limits (unlimited outside the cloud edition). */
-  entitlements: publicProcedure.query(async ({ ctx }) => {
+  /** Limits for a workspace the signed-in user belongs to. */
+  entitlements: publicProcedure.input(z.object({ workspaceId: z.string().max(100).optional() }).optional()).query(async ({ ctx, input }) => {
     if (!ctx.session || !ctx.platform) return null;
-    return ctx.platform.entitlements.forUser(ctx.session.user.id);
+    const workspaceId = input?.workspaceId ?? (await ensurePersonalWorkspace(ctx.db, ctx.session.user.id)).id;
+    if (!(await workspaceRole(ctx.db, ctx.session.user.id, workspaceId))) throw new TRPCError({ code: "FORBIDDEN", message: "You don't belong to this workspace." });
+    return ctx.platform.entitlements.forWorkspace(workspaceId);
   }),
 
   config: router({

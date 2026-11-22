@@ -9,6 +9,7 @@ import { AiCredentialService } from "../services/ai-credential-service";
 import { AiService } from "../services/ai-service";
 import { audit } from "../services/audit-service";
 import { quotaFor } from "../platform/quota";
+import { ensurePersonalWorkspace } from "@Kavero/db/personal-workspace";
 
 const generateInput = z.object({
   brief: z.string().max(4000),
@@ -35,7 +36,7 @@ const providerModelInput = z.object({
 
 function credentials(ctx: Context) {
   if (!ctx.secretBox) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: "Personal AI keys aren't configured on this server" });
-  return new AiCredentialService(ctx.db, ctx.secretBox, { allowLocal: ctx.allowLocalUrls ?? false, appUrl: ctx.appUrl });
+  return new AiCredentialService(ctx.db, ctx.secretBox, { allowLocal: ctx.allowLocalUrls ?? false, appUrl: ctx.appUrl, requireApiKey: ctx.platform?.edition === "cloud" });
 }
 
 export const PERSONAL_AI_KEY_ERROR = "Your AI key in Settings → AI couldn't be used. Check the key, model and server URL, then try again.";
@@ -62,7 +63,10 @@ async function requireAi(ctx: Context, userId: string) {
   const resolved = await resolveAi(ctx, userId);
   if (resolved.error) throw new TRPCError({ code: "PRECONDITION_FAILED", message: resolved.error });
   // Plan limits count requests on the server's model; a personal key is the user's own bill.
-  if (resolved.source === "server") await quotaFor(ctx).consumeAiRequest(userId);
+  if (resolved.source === "server") {
+    const personal = await ensurePersonalWorkspace(ctx.db, userId);
+    await quotaFor(ctx).consumeAiRequest(personal.id);
+  }
   return resolved.provider;
 }
 

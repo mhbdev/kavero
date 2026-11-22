@@ -28,7 +28,7 @@ export const publicationRouter = router({
       const userId = ctx.session.user.id;
       try {
         await quotaFor(ctx).assertCanPublish(userId, input.catalogId);
-        const result = await new PublicationService(ctx.db).publish(userId, input);
+        const result = await new PublicationService(ctx.db, ctx.platform).publish(userId, input);
         await audit(ctx.db, { userId, action: "publication:publish", target: input.catalogId, outcome: "ok", details: { slug: result.slug, visibility: input.visibility, version: result.version } });
         return result;
       } catch (error) {

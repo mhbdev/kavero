@@ -22,7 +22,7 @@ import { toast } from "sonner";
 import { downloadProjectFile, localCatalogs } from "@/modules/catalog/local-catalogs";
 
 import { flushEditorSave } from "./use-catalog-editor";
-import { loadPublicConfig } from "@/lib/public-config";
+import { loadPublicConfig, usePublicConfig } from "@/lib/public-config";
 
 function blobToDataUrl(blob: Blob): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -102,15 +102,16 @@ const MB = 1024 * 1024;
  */
 export async function postExport(url: string, payload: Record<string, unknown>, assets: { files: Map<string, Blob>; urls: Record<string, string> }): Promise<Response> {
   const form = new FormData();
-  form.append("payload", JSON.stringify({ ...payload, assets: assets.urls }));
-  let bytes = 0;
+  const serializedPayload = JSON.stringify({ ...payload, assets: assets.urls });
+  form.append("payload", serializedPayload);
+  let bytes = new TextEncoder().encode(serializedPayload).byteLength + 4096;
   for (const [id, blob] of assets.files) {
     form.append(`asset:${id}`, blob, id);
-    bytes += blob.size;
+    bytes += blob.size + 1024;
   }
   const limitMb = (await loadPublicConfig()).exports?.maxRequestMb;
   if (limitMb && bytes > limitMb * MB) {
-    throw new Error(`This catalog's images and fonts add up to ${Math.ceil(bytes / MB)} MB, over this server's ${limitMb} MB export limit. Use smaller images, or raise "Largest export" in Admin → System → Exports.`);
+    throw new Error(`This catalog and its media need about ${Math.ceil(bytes / MB)} MB, over this server's ${limitMb} MB export request limit. Use smaller images or a runtime with a larger request body limit.`);
   }
   try {
     return await fetch(url, { method: "POST", body: form });
@@ -139,6 +140,18 @@ function download(blob: Blob, name: string) {
   a.download = name;
   a.click();
   setTimeout(() => URL.revokeObjectURL(url), 2000);
+}
+
+async function downloadExportResponse(response: Response, name: string) {
+  if (response.headers.get("content-type")?.includes("application/json")) {
+    const result = await response.json() as { downloadUrl?: string };
+    if (!result.downloadUrl) throw new Error("The export finished but no download link was returned.");
+    // On Vercel, the browser fetches the private object directly. This keeps the
+    // potentially large file out of the function response body.
+    window.location.assign(result.downloadUrl);
+    return;
+  }
+  download(await response.blob(), name);
 }
 
 const escapeHtml = (s: string) => s.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]!);
@@ -265,6 +278,8 @@ export function ExportMenu({ doc, onVideo, prepareDocument, extensionRenderers }
   extensionRenderers?: PptxExtensionRendererRegistry;
 }) {
   const [busy, setBusy] = useState<string | null>(null);
+  const publicConfig = usePublicConfig();
+  const videoEnabled = publicConfig.exports?.videoEnabled !== false;
 
   async function run(kind: string, fn: () => Promise<void>) {
     setBusy(kind);
@@ -282,7 +297,7 @@ export function ExportMenu({ doc, onVideo, prepareDocument, extensionRenderers }
       const document = prepareDocument ? await prepareDocument("pdf", doc) : doc;
       const res = await postExport("/api/export/pdf", { document, pageNumbers }, await collectAssetFiles(document));
       if (!res.ok) throw new Error((await res.json().catch(() => null))?.error ?? "PDF export failed");
-      download(await res.blob(), fileName(document, "pdf"));
+      await downloadExportResponse(res, fileName(document, "pdf"));
       showWarnings("PDF exported", checkExportCompatibility(document, "pdf").map((w) => w.message));
     });
 
@@ -291,7 +306,7 @@ export function ExportMenu({ doc, onVideo, prepareDocument, extensionRenderers }
       const document = prepareDocument ? await prepareDocument("images", doc) : doc;
       const res = await postExport("/api/export/images", { document, width, quality: 90 }, await collectAssetFiles(document));
       if (!res.ok) throw new Error((await res.json().catch(() => null))?.error ?? "Image export failed");
-      download(await res.blob(), fileName(document, "zip"));
+      await downloadExportResponse(res, fileName(document, "zip"));
       showWarnings(`${document.slides.length} slide image${document.slides.length === 1 ? "" : "s"} exported`, checkExportCompatibility(document, "pdf").map((w) => w.message.replace("PDF is static", "Images are static")));
     });
 
@@ -349,7 +364,7 @@ export function ExportMenu({ doc, onVideo, prepareDocument, extensionRenderers }
           <DropdownMenuItem onClick={() => exportImages(1920)}><HugeiconsIcon icon={Image01Icon} /> JPG images (.zip)</DropdownMenuItem>
           <DropdownMenuItem onClick={() => exportImages(3840)}><HugeiconsIcon icon={Image01Icon} /> JPG images, 4K (.zip)</DropdownMenuItem>
           <DropdownMenuItem onClick={exportPowerPoint}><HugeiconsIcon icon={Presentation01Icon} /> PowerPoint (.pptx)</DropdownMenuItem>
-          <DropdownMenuItem onClick={onVideo}><HugeiconsIcon icon={Film01Icon} /> Video (MP4)…</DropdownMenuItem>
+          <DropdownMenuItem onClick={onVideo}><HugeiconsIcon icon={Film01Icon} /> {videoEnabled ? "Video (MP4)…" : "Video (MP4; self-hosted only)…"}</DropdownMenuItem>
           <DropdownMenuItem onClick={exportHtml}><HugeiconsIcon icon={FileScriptIcon} /> Website (single HTML file)</DropdownMenuItem>
           <DropdownMenuItem onClick={exportFlipbook}><HugeiconsIcon icon={BookOpen01Icon} /> Flipbook (.zip)</DropdownMenuItem>
         </DropdownMenuGroup>

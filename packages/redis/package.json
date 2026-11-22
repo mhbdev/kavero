@@ -8,7 +8,7 @@
     "check-types": "tsc --noEmit"
   },
   "dependencies": {
-    "@mhbdev/redis": "0.2.5"
+    "@upstand/redis": "1.0.0"
   },
   "devDependencies": {
     "@Kavero/config": "workspace:*",

@@ -1,6 +1,6 @@
 # Deploying Kavero
 
-Kavero ships as one Next.js server (`apps/web`, standalone output), Postgres and Redis. Binary assets live in object storage (a local folder or an S3-compatible bucket). PDF, video and preview exports need headless Chromium and ffmpeg on the server.
+Kavero's web app is `apps/web`; Postgres stores durable application state and files use local or S3-compatible object storage. Self-hosted deployments can run the web app and media worker together. Cloud deployments run the Next.js web/API app on Vercel and a separate long-lived media worker with shared Postgres, Redis and private object storage. PDF, video and preview exports need headless Chromium and ffmpeg in the runtime that handles them.
 
 ## Editions
 
@@ -10,21 +10,21 @@ One codebase, three editions with the same core features:
 | --- | --- | --- |
 | Self-hosted | default | Accounts and sign-ups as configured in Admin; no plan limits. |
 | Desktop | set by the desktop app (`KAVERO_LOCAL_MODE=1`) | One automatic local account, embedded database, private network allowed by default, in-app updates. |
-| Cloud | `KAVERO_EDITION=cloud` | Adds the plans module: per-account limits (cloud catalogs, published sites, storage, AI requests on the server's model) set in **Admin → System → Plan limits**. Billing providers plug into the same entitlements interface (`packages/api/src/platform`). |
+| Cloud | `KAVERO_EDITION=cloud` | Requires shared Redis, Postgres, S3-compatible storage and transactional email. Workspace limits cover catalogs, published sites and storage; users bring their own AI keys. Billing and Kavero-funded AI are not implemented. See [cloud production readiness](cloud-production-readiness.md). |
 
 ## Admin-managed settings
 
 Most runtime settings don't need environment variables: an admin sets them in **Admin → System** and they apply within seconds on every instance, without a restart:
 
 - **Media storage**: filesystem or S3-compatible (bucket, region, endpoint, keys, path-style), with a **Test storage** button.
-- **AI model**: the server-wide provider, model, API keys and base URL.
+- **AI model**: the server-wide provider, model, API keys and base URL (hidden in cloud; cloud users bring their own keys).
 - **Media library**: Openverse and GIPHY.
 - **Network and security**: private network access, reverse proxy hops.
 - **Exports**: parallel Chrome exports and the largest export.
 - **MCP (agents)**: requests per minute per API key (600 on servers, 6000 in the desktop app; `KAVERO_MCP_RATE_LIMIT`).
-- **Plan limits** (cloud only).
+- **Plan limits** (cloud only; workspace-scoped operator defaults, not subscriptions).
 
-Credentials are encrypted (AES-256-GCM) before they're stored in the database, and never sent back to the browser. A matching environment variable still works: when it's set, it wins and the field shows as locked in the admin panel. That suits infrastructure-as-code setups and keeps existing deployments working unchanged.
+Credentials are encrypted (AES-256-GCM) before they're stored in the database, and never sent back to the browser. A matching environment variable still works: when it's set, it wins and the field shows as locked in the admin panel. Cloud hides operator AI credentials and uses user-supplied provider keys for AI work.
 
 Keep these in the environment: `DATABASE_URL`, `BETTER_AUTH_SECRET`, `BETTER_AUTH_URL`, `KAVERO_ENCRYPTION_KEY`, `REDIS_URL`, `NODE_ENV`, and file paths (`KAVERO_STORAGE_DIR`, `KAVERO_CHROME_PATH`, `FFMPEG_PATH`).
 
@@ -36,7 +36,7 @@ Declared in `apps/web/.env.schema` (varlock). Values come from the process envir
 | --- | --- | --- | --- |
 | `NODE_ENV` | yes | `development` | `production` in deployments. |
 | `DATABASE_URL` | yes | — | Postgres connection string. Sensitive. |
-| `REDIS_URL` | no | unset | Redis connection string for shared rate limits, Better Auth session lookups and short-lived caches. When omitted or unavailable, these use bounded process-local fallback storage. Sensitive if it contains credentials. |
+| `REDIS_URL` | cloud: yes; self-hosted: no | unset | Shared rate limits, Better Auth session lookups, short-lived caches and durable media jobs. Self-hosted/local runtimes can use bounded process-local fallbacks; cloud fails startup or affected requests when shared Redis is unavailable. Sensitive if it contains credentials. |
 | `BETTER_AUTH_SECRET` | yes | — | ≥ 32 random chars (`openssl rand -base64 48`). Signs sessions **and** derives the key that encrypts stored MCP connection credentials: rotating it signs everyone out and makes saved connection tokens unreadable (they must be re-entered). |
 | `KAVERO_ENCRYPTION_KEY` | recommended | unset | ≥ 32 random chars. Encrypts stored credentials (AI keys, MCP tokens, admin settings) independently of `BETTER_AUTH_SECRET`, so that secret can be rotated. Values saved before you set it stay readable. Back it up: losing it makes stored credentials unreadable. Sensitive. |
 | `KAVERO_EDITION` | no | `self-hosted` | `self-hosted`, `cloud` or `desktop` (the desktop app sets it implicitly). |
@@ -102,11 +102,11 @@ Create new migrations in development with `bun run db:generate` after changing `
 
 `KAVERO_MAX_BROWSERS`, `KAVERO_MAX_EXPORT_MB`, `TRUST_PROXY`, the `S3_*`, `STORAGE_DRIVER`, `AI_*`, `*_API_KEY` and `NEXT_PUBLIC_*` media variables can all be managed in Admin → System instead.
 
-Export requests are capped at 60 MB by default (1 GB in the desktop app; change it with `KAVERO_MAX_EXPORT_MB` or Admin → System → Exports) and page sizes at 10000 px. Export browsers can only load the app itself, Google Fonts and public HTTPS addresses.
+Export requests are capped at 60 MB by default on a server and 1 GB in the desktop app; self-hosted operators can change this with `KAVERO_MAX_EXPORT_MB` or Admin → System → Exports. Vercel imposes a smaller platform cap: Kavero uses 4 MiB by default. Keep `VERCEL_SUPPORT_LARGE_REQUEST_BODY` unset on Hobby because Vercel's 20 MiB request-body public beta requires the 4 GB Performance memory setting, above Hobby's 2 GB limit; on eligible plans Kavero caps requests at 19 MiB. This does not raise the 4.5 MiB function response limit. PDF and image exports are written to private S3/R2 and returned through signed downloads. Export browsers can only load the app itself, Google Fonts and public HTTPS addresses. See [Vercel's limits](https://vercel.com/docs/functions/limitations) and [large request body beta](https://vercel.com/changelog/vercel-functions-now-support-request-bodies-up-to-20mib).
 
 ## Admin accounts
 
-- On a new server, **the first account that signs up becomes the admin**. Create your own account right after deploying, before sharing the address.
+- On a cloud deployment, set `KAVERO_BOOTSTRAP_ADMIN_EMAIL` before sign-up. Only the exact matching, email-verified account receives the initial admin role. For self-hosted deployments, use `bun run make-admin you@example.com` to grant the first admin explicitly.
 - Servers upgraded from a version without admins: the migration makes the **oldest account** the admin if none exists. Check **Admin → Users** after upgrading.
 - Admins can make other accounts admins and choose who may sign up (open, invite-only or closed) in **Admin → Sign-ups**. For a private company server, set it to invite-only or closed once your team has joined.
 - Recovering admin access (run where the app's `DATABASE_URL` is available):
@@ -119,13 +119,13 @@ Export requests are capped at 60 MB by default (1 GB in the desktop app; change 
 
 ## Hosting options
 
-Kavero needs a long-running Node server (API routes, MCP endpoint, background video jobs) with Chromium available. Pick by scale:
+Kavero needs a Node runtime with Chromium for exports and a long-lived worker for background media jobs. Pick by deployment:
 
 | Option | Good for | Notes |
 | --- | --- | --- |
 | **One VPS + Docker Compose** (recommended start) | Teams, small business | Any Linux VM with 2 vCPU / 4 GB RAM. `docker compose up -d --build`, a reverse proxy for HTTPS (below), daily backups. |
 | **Container platforms** (Fly.io, Railway, Render, Coolify, Dokku, Kubernetes) | Managed ops | Deploy `apps/web/Dockerfile` with a managed Postgres; use S3/R2 storage so instances are stateless. Give it ≥ 1 GB shared memory for Chromium. |
-| **Serverless (Vercel, Netlify)** | Not recommended | No Chromium for PDF/video/previews, short function timeouts, no in-memory video jobs. Editor, sync and publishing work; exports don't. |
+| **Vercel web + separate worker** | Cloud web/API service | Run the Next.js web/API on Vercel with Postgres, shared Redis, S3/R2 and email. Deploy the `worker` Docker target on a long-lived container host to process media jobs. PDF and image exports are supported; MP4 export stays disabled until a durable export worker exists. See [cloud production readiness](cloud-production-readiness.md) for setup and platform limits. |
 | **Desktop app** | Single user, offline | See [desktop.md](desktop.md). |
 
 ### VPS walkthrough
@@ -177,7 +177,7 @@ Needed for PDF export, video export, slide previews (MCP `catalog_preview`) and 
 
 Rendering loads the app's own `/render` page over HTTP at the **request's origin**, so the server must be able to reach the URL users reach it on (behind a proxy: make sure the public hostname resolves from inside the container, or route it back internally).
 
-Video exports render in-process (max 3 concurrent jobs), write to the OS temp dir, and are tracked in memory: a restart drops running jobs, and with several instances a user must hit the same instance to download (use sticky sessions).
+Video exports render in-process (max 3 concurrent jobs), write to the OS temp dir, and are tracked in memory. A restart drops running jobs, and with several instances a user must hit the same instance to download (use sticky sessions). Vercel disables MP4 exports because serverless requests can land on different instances and do not provide a persistent worker or shared job state for this route.
 
 ## Backup and recovery
 

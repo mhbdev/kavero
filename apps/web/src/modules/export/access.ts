@@ -4,6 +4,7 @@ import { BrowserBusyError, isBrowserClosedError } from "@Kavero/export-chromium"
 import { z } from "zod";
 
 import { runtimeConfig } from "@/platform";
+import { objectStorage } from "@/modules/storage/object-storage";
 import { auth, db } from "@/services";
 
 const LOCAL_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]"]);
@@ -48,7 +49,37 @@ export function renderOrigin(request: Request): string {
  */
 export function maxExportBytes(): number {
   const mb = runtimeConfig.valuesSync("exports").maxRequestMb;
-  return (typeof mb === "number" && mb > 0 ? mb : 60) * 1024 * 1024;
+  const configuredMb = typeof mb === "number" && mb > 0 ? mb : 60;
+  if (process.env.VERCEL === "1") {
+    // Vercel functions default to a 4.5 MiB body limit. The 20 MiB preview
+    // requires an explicit project opt-in and 4 GB function memory. Leave
+    // space for multipart headers and the document JSON.
+    const platformMb = process.env.VERCEL_SUPPORT_LARGE_REQUEST_BODY === "1" ? 19 : 4;
+    return Math.min(configuredMb, platformMb) * 1024 * 1024;
+  }
+  return configuredMb * 1024 * 1024;
+}
+
+/** Deliver an export directly from private object storage on Vercel. */
+export async function exportDownloadResponse(bytes: Uint8Array, contentType: string, filename: string): Promise<Response> {
+  const headers = { "Cache-Control": "no-store" };
+  if (process.env.VERCEL === "1") {
+    const storage = await objectStorage();
+    if (!(await storage.supportsPresignedUrls())) {
+      return Response.json({ error: "Vercel exports require private S3-compatible storage with signed downloads." }, { status: 503, headers });
+    }
+    const key = `exports/${crypto.randomUUID()}/${filename}`;
+    // Generic binary type makes browsers download the object. The filename is
+    // the final key segment; a bucket lifecycle rule removes temporary exports.
+    await storage.putImmutable(key, bytes, "application/octet-stream");
+    const downloadUrl = await storage.presignDownload(key, 300);
+    return Response.json({ downloadUrl }, { headers });
+  }
+
+  const { attachmentHeader } = await import("@Kavero/catalog-engine");
+  return new Response(new Blob([bytes as BlobPart], { type: contentType }), {
+    headers: { ...headers, "Content-Disposition": attachmentHeader(filename) },
+  });
 }
 
 const EXPORT_MEDIA_TYPE = /^(image\/(png|jpe?g|gif|webp|avif|svg\+xml)|video\/(mp4|webm)|font\/(ttf|otf|woff2?))$/;

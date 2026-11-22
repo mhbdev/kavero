@@ -74,7 +74,7 @@ Element = text | image | shape | product | product-grid | icon | video | button 
 
 ## Exports
 
-Redis shared through @Kavero/redis and @mhbdev/redis backs request limits, Better Auth secondary session/verification lookup storage, and short-lived server caches. When REDIS_URL is unset or Redis is unavailable, bounded TTL/fixed-window process-local storage keeps the app available; Postgres remains the durable source of truth for auth records.
+Redis shared through @Kavero/redis and @upstand/redis backs request limits, Better Auth secondary session/verification lookup storage, and short-lived server caches. Local/self-hosted runtimes can use bounded TTL/fixed-window process-local storage; cloud requires shared Redis for consistent auth state, rate limits and durable jobs. Postgres remains the durable source of truth for auth records and job state.
 
 - PDF, PNG previews, video: `export-chromium` opens `/render` in headless Chrome at the request's origin, injects the document, steps `animation-engine` frame by frame, and (for video) pipes frames to ffmpeg.
 - PPTX: generated client-side by `export-pptx`.

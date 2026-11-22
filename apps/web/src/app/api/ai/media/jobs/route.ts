@@ -1,11 +1,11 @@
 import { AiCredentialService } from "@Kavero/api/services/ai-credential-service";
 import { readLimited } from "@Kavero/api/services/safe-fetch";
-import { SecretBox } from "@Kavero/api/services/secret-box";
 import { z } from "zod";
 
 import { ENV } from "@/env.server";
 import { auth, db } from "@/services";
 import { startMediaJob, publicMediaJob } from "@/modules/ai/media-jobs";
+import { allowPrivateUrls, platform, secretBox } from "@/platform";
 
 export const runtime = "nodejs";
 export const maxDuration = 300;
@@ -15,6 +15,7 @@ const schema = z.object({
   purpose: z.enum(["image", "video"]),
   prompt: z.string().trim().min(3).max(2000),
   aspectRatio: z.string().regex(/^[1-9]\d{0,4}:[1-9]\d{0,4}$/).refine((value) => value.split(":").every((part) => Number(part) <= 10_000)).default("16:9"),
+  workspaceId: z.string().max(100).optional(),
 });
 
 export async function POST(request: Request) {
@@ -31,9 +32,9 @@ export async function POST(request: Request) {
   const parsed = schema.safeParse(raw);
   if (!parsed.success) return Response.json({ error: "Enter a prompt and a supported aspect ratio." }, { status: 400 });
   try {
-    const service = new AiCredentialService(db, new SecretBox(ENV.BETTER_AUTH_SECRET), { allowLocal: process.env.NODE_ENV !== "production", appUrl: ENV.BETTER_AUTH_URL });
+    const service = new AiCredentialService(db, secretBox, { allowLocal: await allowPrivateUrls(), appUrl: ENV.BETTER_AUTH_URL, requireApiKey: platform.edition === "cloud" });
     const connection = await service.mediaCredential(session.user.id, parsed.data.purpose);
-    const job = await startMediaJob({ userId: session.user.id, ...parsed.data, ...connection });
+    const job = await startMediaJob({ userId: session.user.id, ...parsed.data, provider: connection.provider, model: connection.model });
     return Response.json(publicMediaJob(job), { status: 202, headers: { "Cache-Control": "private, no-store" } });
   } catch (error) {
     const message = error instanceof Error ? error.message : "Could not start media generation.";
@@ -43,7 +44,11 @@ export async function POST(request: Request) {
     if (error instanceof Error && error.name === "MediaJobRateLimitError") {
       return Response.json({ error: message }, { status: 429, headers: { "Retry-After": "60", "Cache-Control": "private, no-store" } });
     }
-    const status = error && typeof error === "object" && "code" in error && (error as { code?: string }).code === "PRECONDITION_FAILED" ? 412 : 400;
+    const errorCode = error && typeof error === "object" && "code" in error ? (error as { code?: string }).code : undefined;
+    const status = errorCode === "PRECONDITION_FAILED" ? 412
+      : errorCode === "FORBIDDEN" || (error instanceof Error && error.message.includes("editor role")) ? 403
+      : error instanceof Error && (error.message.includes("REDIS_URL") || error.message.includes("Shared Redis is unavailable")) ? 503
+      : 400;
     return Response.json({ error: message }, { status, headers: { "Cache-Control": "private, no-store" } });
   }
 }

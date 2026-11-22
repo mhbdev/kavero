@@ -5,7 +5,7 @@ import { useEffect, useState } from "react";
 export interface PublicConfig {
   edition: "desktop" | "self-hosted" | "cloud";
   media: { openverseEnabled: boolean; giphyApiKey: string };
-  exports?: { maxRequestMb: number };
+  exports?: { maxRequestMb: number; videoEnabled?: boolean };
 }
 
 /** Build-time values, used until (or if) the server's runtime settings load. */

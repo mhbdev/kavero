@@ -14,6 +14,25 @@ RUN --mount=type=secret,id=web_env,target=/app/apps/web/.env.local cd apps/web &
 # standalone output excludes public/; ensure it exists so the runner copy never fails
 RUN mkdir -p apps/web/public
 
+# The worker runs separately from Next.js so long image/video jobs survive serverless requests.
+FROM node:24-slim AS worker
+COPY --from=oven/bun:1 /usr/local/bin/bun /usr/local/bin/bun
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends ffmpeg ca-certificates \
+  && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+COPY --from=builder --chown=node:node /app/node_modules ./node_modules
+COPY --from=builder --chown=node:node /app/packages ./packages
+COPY --from=builder --chown=node:node /app/apps/web/package.json ./apps/web/package.json
+COPY --from=builder --chown=node:node /app/apps/web/tsconfig.json ./apps/web/tsconfig.json
+COPY --from=builder --chown=node:node /app/apps/web/.env.schema ./apps/web/.env.schema
+COPY --from=builder --chown=node:node /app/apps/web/src ./apps/web/src
+COPY --from=builder --chown=node:node /app/apps/web/scripts/media-worker.ts ./apps/web/scripts/media-worker.ts
+ENV NODE_ENV=production FFMPEG_PATH=/usr/bin/ffmpeg
+USER node
+WORKDIR /app/apps/web
+CMD ["bun", "scripts/media-worker.ts"]
+
 FROM node:24-slim AS runner
 # Chromium + ffmpeg power PDF/video/preview exports; fonts keep rendering consistent.
 RUN apt-get update \

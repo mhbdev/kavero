@@ -10,6 +10,7 @@ import { useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 
 import { resolveGiphyMediaUrl } from "@/modules/media/giphy";
+import { usePublicConfig } from "@/lib/public-config";
 import { makeTRPCClient } from "@/utils/trpc";
 
 import { collectAssetFiles, hasUnstoredVideoUrl, missingReferencedMedia, postExport } from "./export-menu";
@@ -47,6 +48,8 @@ export function VideoExportButton({ doc, defaultOpen = false, prepareDocument }:
   defaultOpen?: boolean;
   prepareDocument?: (format: "video", document: CatalogDocument) => Promise<CatalogDocument>;
 }) {
+  const publicConfig = usePublicConfig();
+  const videoEnabled = publicConfig.exports?.videoEnabled !== false;
   const [open, setOpen] = useState(defaultOpen);
   const [height, setHeight] = useState<(typeof HEIGHTS)[number]>(1080);
   const [fps, setFps] = useState<24 | 30 | 60>(30);
@@ -105,7 +108,12 @@ export function VideoExportButton({ doc, defaultOpen = false, prepareDocument }:
       <Button variant="ghost" size="sm" className="text-white hover:bg-white/10" onClick={() => setOpen(!open)}><HugeiconsIcon icon={Film01Icon} /> Export video</Button>
       {open && (
         <div className="absolute right-0 bottom-full mb-2 w-72 rounded-xl border border-white/15 bg-neutral-900 p-3 text-xs text-white shadow-xl">
-          {!job || !running ? (
+          {!videoEnabled ? (
+            <div className="grid gap-2">
+              <span className="font-semibold">MP4 export is unavailable on Vercel</span>
+              <p className="text-white/60">This export needs a persistent background worker and shared job storage. Run Kavero on a long-lived container host to enable it.</p>
+            </div>
+          ) : !job || !running ? (
             <div className="grid gap-2">
               <div className="flex items-center justify-between">
                 <span className="font-semibold">MP4 video</span>

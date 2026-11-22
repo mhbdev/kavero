@@ -4,10 +4,11 @@ import {
 } from "./repository";
 
 const DB_NAME = "kavero";
-const DB_VERSION = 1;
+const DB_VERSION = 2;
 const DOCS = "documents";
 const SUMMARIES = "summaries";
 const ASSETS = "assets";
+const BLOBS = "assetBlobs";
 
 function req<T>(r: IDBRequest<T>): Promise<T> {
   return new Promise((resolve, reject) => {
@@ -38,11 +39,28 @@ export class IndexedDbCatalogRepository implements CatalogRepository {
     if (!this.factory) return Promise.reject(new Error("IndexedDB is not available in this environment"));
     this.dbPromise ??= new Promise((resolve, reject) => {
       const open = this.factory.open(this.dbName, DB_VERSION);
-      open.onupgradeneeded = () => {
+      open.onupgradeneeded = (event) => {
         const db = open.result;
         if (!db.objectStoreNames.contains(DOCS)) db.createObjectStore(DOCS, { keyPath: "id" });
         if (!db.objectStoreNames.contains(SUMMARIES)) db.createObjectStore(SUMMARIES, { keyPath: "id" }).createIndex("updatedAt", "updatedAt");
-        if (!db.objectStoreNames.contains(ASSETS)) db.createObjectStore(ASSETS, { keyPath: "id" }).createIndex("catalogId", "catalogId");
+        const blobs = db.objectStoreNames.contains(BLOBS) ? open.transaction!.objectStore(BLOBS) : db.createObjectStore(BLOBS, { keyPath: "hash" });
+        const assets = db.objectStoreNames.contains(ASSETS)
+          ? open.transaction!.objectStore(ASSETS)
+          : db.createObjectStore(ASSETS, { keyPath: "id" });
+        if (!assets.indexNames.contains("catalogId")) assets.createIndex("catalogId", "catalogId");
+        if (!assets.indexNames.contains("hash")) assets.createIndex("hash", "hash");
+        if (event.oldVersion > 0 && event.oldVersion < 2) {
+          const cursorRequest = assets.openCursor();
+          cursorRequest.onsuccess = () => {
+            const cursor = cursorRequest.result;
+            if (!cursor) return;
+            const old = cursor.value as StoredAsset;
+            const hash = old.hash || old.id;
+            if (old.blob instanceof Blob) blobs.put({ hash, blob: old.blob });
+            cursor.update({ id: old.id, catalogId: old.catalogId, hash });
+            cursor.continue();
+          };
+        }
       };
       open.onsuccess = () => resolve(open.result);
       open.onerror = () => reject(open.error);
@@ -99,11 +117,15 @@ export class IndexedDbCatalogRepository implements CatalogRepository {
 
   async delete(id: string): Promise<void> {
     const db = await this.db();
-    const tx = db.transaction([DOCS, SUMMARIES, ASSETS], "readwrite");
+    const tx = db.transaction([DOCS, SUMMARIES, ASSETS, BLOBS], "readwrite");
     tx.objectStore(DOCS).delete(id);
     tx.objectStore(SUMMARIES).delete(id);
-    const keys = await req(tx.objectStore(ASSETS).index("catalogId").getAllKeys(id));
-    for (const k of keys) tx.objectStore(ASSETS).delete(k);
+    const assets = tx.objectStore(ASSETS);
+    const refs = await req(assets.index("catalogId").getAll(id)) as Array<{ id: string; hash: string }>;
+    for (const ref of refs) assets.delete(ref.id);
+    for (const hash of new Set(refs.map((ref) => ref.hash))) {
+      if (await req(assets.index("hash").count(hash)) === 0) tx.objectStore(BLOBS).delete(hash);
+    }
     await done(tx);
   }
 
@@ -119,25 +141,45 @@ export class IndexedDbCatalogRepository implements CatalogRepository {
 
   async putAsset(asset: StoredAsset): Promise<void> {
     const db = await this.db();
-    const tx = db.transaction(ASSETS, "readwrite");
-    tx.objectStore(ASSETS).put(asset);
+    const hash = await sha256(asset.blob);
+    const tx = db.transaction([ASSETS, BLOBS], "readwrite");
+    const assets = tx.objectStore(ASSETS);
+    const previous = await req(assets.get(asset.id)) as { id: string; hash: string } | undefined;
+    assets.put({ id: asset.id, catalogId: asset.catalogId, hash });
+    tx.objectStore(BLOBS).put({ hash, blob: asset.blob });
+    if (previous && previous.hash !== hash && await req(assets.index("hash").count(previous.hash)) === 0) tx.objectStore(BLOBS).delete(previous.hash);
     await done(tx);
   }
 
   async removeAsset(id: string): Promise<void> {
     const db = await this.db();
-    const tx = db.transaction(ASSETS, "readwrite");
-    tx.objectStore(ASSETS).delete(id);
+    const tx = db.transaction([ASSETS, BLOBS], "readwrite");
+    const assets = tx.objectStore(ASSETS);
+    const previous = await req(assets.get(id)) as { hash: string } | undefined;
+    assets.delete(id);
+    if (previous && await req(assets.index("hash").count(previous.hash)) === 0) tx.objectStore(BLOBS).delete(previous.hash);
     await done(tx);
   }
 
   async getAsset(id: string): Promise<StoredAsset | null> {
     const db = await this.db();
-    return ((await req(db.transaction(ASSETS).objectStore(ASSETS).get(id))) as StoredAsset | undefined) ?? null;
+    const tx = db.transaction([ASSETS, BLOBS]);
+    const ref = await req(tx.objectStore(ASSETS).get(id)) as { id: string; catalogId: string; hash: string } | undefined;
+    if (!ref) return null;
+    const stored = await req(tx.objectStore(BLOBS).get(ref.hash)) as { blob?: Blob } | undefined;
+    return stored?.blob ? { ...ref, blob: stored.blob } : null;
   }
 
   async listAssets(catalogId: string): Promise<StoredAsset[]> {
     const db = await this.db();
-    return (await req(db.transaction(ASSETS).objectStore(ASSETS).index("catalogId").getAll(catalogId))) as StoredAsset[];
+    const tx = db.transaction([ASSETS, BLOBS]);
+    const refs = await req(tx.objectStore(ASSETS).index("catalogId").getAll(catalogId)) as Array<{ id: string; catalogId: string; hash: string }>;
+    const blobs = await Promise.all(refs.map((ref) => req(tx.objectStore(BLOBS).get(ref.hash)) as Promise<{ blob?: Blob } | undefined>));
+    return refs.flatMap((ref, index) => blobs[index]?.blob ? [{ ...ref, blob: blobs[index]!.blob! }] : []);
   }
+}
+
+async function sha256(blob: Blob): Promise<string> {
+  const bytes = await crypto.subtle.digest("SHA-256", await blob.arrayBuffer());
+  return [...new Uint8Array(bytes)].map((value) => value.toString(16).padStart(2, "0")).join("");
 }

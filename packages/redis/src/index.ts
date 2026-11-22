@@ -1,13 +1,18 @@
 import { createHash } from "node:crypto";
 
 import {
-  createCache as createMhbCache,
-  createRateLimiter as createMhbRateLimiter,
+  createCache as createUpstandCache,
+  createRedisQueue as createUpstandQueue,
+  createRateLimiter as createUpstandRateLimiter,
   createRedisClient,
   fixedWindow,
   isRedisErrorCode,
+  type JobQueue,
   type RedisClient,
-} from "@mhbdev/redis";
+  type QueueOptions,
+} from "@upstand/redis";
+
+export type { JobQueue, QueueJob } from "@upstand/redis";
 
 const DEFAULT_MAX_FALLBACK_ENTRIES = 50_000;
 const OPERATIONAL_REDIS_ERRORS = [
@@ -74,9 +79,34 @@ function runtime(redisUrl?: string): RedisRuntime | null {
   return runtimeGlobal.__kaveroRedisRuntime;
 }
 
+/** Queue with the same Redis client configuration used by Kavero's other shared services. */
+export function createRedisJobQueue<T>(options: Omit<QueueOptions<T>, "redis"> & { redisUrl?: string }): JobQueue<T> {
+  const rt = runtime(options.redisUrl);
+  if (!rt?.client) throw new Error("REDIS_URL is required for durable background jobs.");
+  const { redisUrl: _redisUrl, ...queueOptions } = options;
+  return createUpstandQueue<T>({ ...queueOptions, redis: rt.client });
+}
+
+/** Close the process-owned Redis connection during worker shutdown. */
+export async function closeRedisRuntime(redisUrl?: string) {
+  await runtime(redisUrl)?.client?.close();
+}
+
+/** Reachability probe used by cloud readiness checks. */
+export async function pingRedis(redisUrl?: string) {
+  const rt = runtime(redisUrl);
+  if (!rt?.url || !rt.client) return false;
+  try {
+    await rt.client.ping();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function operationalRedisFailure(error: unknown) {
   if (OPERATIONAL_REDIS_ERRORS.some((code) => isRedisErrorCode(error, code))) return true;
-  // Redis reports capacity pressure as an error reply (wrapped by mhbdev as a
+  // Redis reports capacity pressure as an error reply (wrapped by @upstand/redis as a
   // protocol error). Treat transient server pressure like an outage so bounded
   // local fallbacks remain available, while surfacing command/schema mistakes.
   if (!isRedisErrorCode(error, "REDIS_PROTOCOL_ERROR")) return false;
@@ -117,14 +147,14 @@ export type RedisCacheStore<T> = {
   delete(key: string): Promise<void>;
 };
 
-/** Typed TTL cache backed by @mhbdev/redis, with a bounded expiring process-local fallback. */
+/** Typed TTL cache backed by @upstand/redis, with a bounded expiring process-local fallback. */
 export function createCacheStore<T>(namespace: string, options: { defaultTtlMs?: number; maxEntries?: number; redisUrl?: string } = {}): RedisCacheStore<T> {
   const name = validNamespace(namespace);
   const prefix = "kavero:v1:cache:" + name;
   const ttl = options.defaultTtlMs ?? 5 * 60_000;
   const maxEntries = options.maxEntries ?? DEFAULT_MAX_FALLBACK_ENTRIES;
   const rt = runtime(options.redisUrl);
-  const cache = rt?.client ? createMhbCache<T>({ redis: rt.client, prefix }) : null;
+  const cache = rt?.client ? createUpstandCache<T>({ redis: rt.client, prefix }) : null;
   const localKey = (key: string) => name + ":" + hash(key);
 
   return {
@@ -205,17 +235,19 @@ export function createResilientRateLimiter(options: {
   windowMs: number;
   maxFallbackEntries?: number;
   redisUrl?: string;
+  /** `error` is for shared cloud limits that must never silently become per-process. */
+  fallbackMode?: "local" | "error";
 }): ResilientRateLimiter {
   const name = validNamespace(options.namespace);
   if (!Number.isSafeInteger(options.maxRequests) || options.maxRequests < 1) throw new Error("Rate-limit maxRequests must be a positive integer.");
   if (!Number.isSafeInteger(options.windowMs) || options.windowMs < 1) throw new Error("Rate-limit windowMs must be a positive integer.");
   const rt = runtime(options.redisUrl);
-  const limiter = rt?.client ? createMhbRateLimiter(fixedWindow(options.maxRequests, options.windowMs), {
+  const limiter = rt?.client ? createUpstandRateLimiter(fixedWindow(options.maxRequests, options.windowMs), {
     redis: rt.client,
     prefix: "kavero:v1:rate:" + name,
     timeoutMs: 1_200,
     ephemeralCache: false,
-    // "open" lets this adapter identify operational failures and apply its bounded local fallback.
+    // Let this adapter decide whether a bounded local fallback is acceptable.
     failureMode: "open",
   }) : null;
   const fallbackKey = (identifier: string) => name + ":" + hash(identifier);
@@ -263,6 +295,7 @@ export function createResilientRateLimiter(options: {
     async limit(identifier, weight = 1) {
       if (!Number.isSafeInteger(weight) || weight < 1 || weight > options.maxRequests) throw new Error("Rate-limit weight must be a positive integer no greater than maxRequests.");
       const result = await redisLimit(identifier, weight);
+      if (result === null && options.fallbackMode === "error") throw new Error("Shared Redis is unavailable; this request cannot be admitted safely.");
       return result ?? localLimit(identifier, weight);
     },
     async getRemaining(identifier) {
@@ -281,6 +314,7 @@ export function createResilientRateLimiter(options: {
           warnFallback(rt, name, error);
         }
       }
+      if (options.fallbackMode === "error") throw new Error("Shared Redis is unavailable; this request cannot be admitted safely.");
       const now = Date.now();
       const resetAt = new Date(Math.floor(now / options.windowMs) * options.windowMs + options.windowMs);
       return { remaining: options.maxRequests, resetAt };
@@ -288,15 +322,16 @@ export function createResilientRateLimiter(options: {
   };
 }
 
-/** Better Auth secondary storage mirrored in Redis and backed by bounded local memory during outages. */
-export function createBetterAuthSecondaryStorage(namespace = "better-auth", redisUrl?: string) {
+/** Better Auth secondary storage with an explicit local fallback policy. */
+export function createBetterAuthSecondaryStorage(namespace = "better-auth", redisUrl?: string, fallbackMode: "local" | "error" = "local") {
   const name = validNamespace(namespace);
   const rt = runtime(redisUrl);
   const prefix = "kavero:v1:auth:" + name;
-  const cache = rt?.client ? createMhbCache<string>({ redis: rt.client, prefix }) : null;
+  const cache = rt?.client ? createUpstandCache<string>({ redis: rt.client, prefix }) : null;
   const storageKey = (key: string) => hash(key);
   const fullKey = (key: string) => prefix + ":" + storageKey(key);
   const localKey = (key: string) => "auth:" + name + ":" + storageKey(key);
+  const unavailable = () => new Error("Shared Redis is unavailable; authentication storage cannot safely fall back to process-local state.");
 
   async function localGet(key: string) {
     if (!rt) return undefined;
@@ -325,11 +360,14 @@ export function createBetterAuthSecondaryStorage(namespace = "better-auth", redi
             rt.cacheFallback.delete(localKey(key));
             return value;
           }
+          return undefined;
         } catch (error) {
           if (!operationalRedisFailure(error)) throw error;
+          if (fallbackMode === "error") throw unavailable();
           warnFallback(rt, name, error);
         }
       }
+      if (fallbackMode === "error") throw unavailable();
       return localGet(key);
     },
     async getAndDelete(key: string) {
@@ -351,9 +389,11 @@ export function createBetterAuthSecondaryStorage(namespace = "better-auth", redi
           return fallback;
         } catch (error) {
           if (!operationalRedisFailure(error)) throw error;
+          if (fallbackMode === "error") throw unavailable();
           warnFallback(rt, name, error);
         }
       }
+      if (fallbackMode === "error") throw unavailable();
       const value = await localGet(key);
       rt?.cacheFallback.delete(localKey(key));
       return value;
@@ -371,9 +411,11 @@ export function createBetterAuthSecondaryStorage(namespace = "better-auth", redi
           return Number(result);
         } catch (error) {
           if (!operationalRedisFailure(error)) throw error;
+          if (fallbackMode === "error") throw unavailable();
           warnFallback(rt, name, error);
         }
       }
+      if (fallbackMode === "error") throw unavailable();
       const local = await localGet(key);
       const count = Number(local ?? 0) + 1;
       remember(key, String(count), ttlSeconds);
@@ -388,27 +430,33 @@ export function createBetterAuthSecondaryStorage(namespace = "better-auth", redi
           return;
         } catch (error) {
           if (!operationalRedisFailure(error)) throw error;
+          if (fallbackMode === "error") throw unavailable();
           warnFallback(rt, name, error);
         }
       }
+      if (fallbackMode === "error") throw unavailable();
       remember(key, stringValue, ttlSeconds);
     },
     async delete(key: string) {
       if (rt && cache) {
         try {
           await cache.delete(storageKey(key));
+          rt.cacheFallback.delete(localKey(key));
+          return;
         } catch (error) {
           if (!operationalRedisFailure(error)) throw error;
+          if (fallbackMode === "error") throw unavailable();
           warnFallback(rt, name, error);
         }
       }
+      if (fallbackMode === "error") throw unavailable();
       rt?.cacheFallback.delete(localKey(key));
     },
   };
 }
 
 /** Better Auth custom rate-limit storage backed by the shared Redis limiter. */
-export function createBetterAuthRateLimitStorage(namespace = "better-auth", redisUrl?: string) {
+export function createBetterAuthRateLimitStorage(namespace = "better-auth", redisUrl?: string, fallbackMode: "local" | "error" = "local") {
   const limiters = new Map<string, ResilientRateLimiter>();
   return {
     async consume(key: string, rule: { window: number; max: number }) {
@@ -421,6 +469,7 @@ export function createBetterAuthRateLimitStorage(namespace = "better-auth", redi
           maxRequests: rule.max,
           windowMs: windowSeconds * 1_000,
           redisUrl,
+          fallbackMode,
         });
         limiters.set(limiterKey, limiter);
       }

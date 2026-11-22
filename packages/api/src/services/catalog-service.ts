@@ -4,12 +4,14 @@ import { checkIntegrity, parseCatalogDocument, type CatalogDocument } from "@Kav
 import { applyCommand, type EditorCommand } from "@Kavero/editor-core";
 import type { Database } from "@Kavero/db";
 import { ensurePersonalWorkspace } from "@Kavero/db/personal-workspace";
-import { catalog, catalogAsset, catalogRevision } from "@Kavero/db/schema/catalog";
+import { catalog, catalogAsset, catalogRevision, catalogUpload } from "@Kavero/db/schema/catalog";
 import { publicationAsset } from "@Kavero/db/schema/publication";
 import { workspace, workspaceMember, type WorkspaceRole } from "@Kavero/db/schema/workspace";
 import { TRPCError } from "@trpc/server";
-import { and, desc, eq, inArray, lt, notInArray } from "drizzle-orm";
+import { and, desc, eq, gt, inArray, isNull, lt, notInArray } from "drizzle-orm";
 
+import { quotaFor } from "../platform/quota";
+import type { Platform } from "../platform/edition";
 import { ROLE_PERMISSIONS, isUniqueViolation, memberJoin, requireCatalog, visibleTo, workspaceRole, type CatalogPermission } from "./access";
 
 /** How many earlier versions to keep per catalog. */
@@ -50,7 +52,7 @@ const summaryColumns = {
  * so tRPC, MCP tools and route handlers share one set of rules.
  */
 export class CatalogService {
-  constructor(private readonly db: Database, private readonly deleteObjects?: (keys: string[]) => Promise<void>) {}
+  constructor(private readonly db: Database, private readonly deleteObjects?: (keys: string[]) => Promise<void>, private readonly platform?: Platform) {}
 
   /** Personal catalogs plus catalogs in the user's workspaces. */
   async list(userId: string): Promise<CloudCatalogSummary[]> {
@@ -65,8 +67,8 @@ export class CatalogService {
   }
 
   /** Access-checked lookup by row id or document id. */
-  async access(userId: string, id: string, need: CatalogPermission) {
-    return requireCatalog(this.db, userId, id, need);
+  async access(userId: string, id: string, need: CatalogPermission, options: { forUpdate?: boolean } = {}) {
+    return requireCatalog(this.db, userId, id, need, options);
   }
 
   async get(userId: string, id: string) {
@@ -113,6 +115,12 @@ export class CatalogService {
         if (input.baseRevision !== undefined) {
           throw new TRPCError({ code: "NOT_FOUND", message: "This catalog was deleted from the cloud" });
         }
+        const [lockedWorkspace] = await tx.select({ id: workspace.id }).from(workspace).where(eq(workspace.id, targetWorkspaceId)).for("update");
+        if (!lockedWorkspace) throw new TRPCError({ code: "NOT_FOUND", message: "Workspace not found." });
+        const transactionalDb = tx as unknown as Database;
+        const role = await workspaceRole(transactionalDb, userId, targetWorkspaceId);
+        if (!role || !ROLE_PERMISSIONS[role].includes("write")) throw new TRPCError({ code: "FORBIDDEN", message: "You can't add catalogs to that workspace" });
+        await quotaFor({ db: transactionalDb, platform: this.platform }).assertCanSaveCatalog(userId, targetWorkspaceId, doc.id);
         const id = randomUUID();
         await tx.insert(catalog).values({
           id, ownerId: userId, workspaceId: targetWorkspaceId, documentId: doc.id, title: doc.metadata.title, slideCount: doc.slides.length,
@@ -146,6 +154,12 @@ export class CatalogService {
         ? and(eq(catalogAsset.catalogId, existing.id), notInArray(catalogAsset.assetId, ids))
         : eq(catalogAsset.catalogId, existing.id));
       await tx.delete(catalogAsset).where(ids.length ? and(eq(catalogAsset.catalogId, existing.id), notInArray(catalogAsset.assetId, ids)) : eq(catalogAsset.catalogId, existing.id));
+      // A presigned URL cannot be revoked. Mark removed uploads as finished so
+      // they stop reserving quota, but retain their rows and staging objects
+      // until their signed URLs have expired and the worker can clean them.
+      await tx.update(catalogUpload).set({ completedAt: new Date() }).where(ids.length
+        ? and(eq(catalogUpload.catalogId, existing.id), notInArray(catalogUpload.assetId, ids), isNull(catalogUpload.completedAt))
+        : and(eq(catalogUpload.catalogId, existing.id), isNull(catalogUpload.completedAt)));
       return { id: existing.id, revision, created: false, removedStorageKeys: removedAssets.map((asset) => asset.storageKey) };
     }).catch((e) => {
       // Two first saves of the same document raced; the other one created the cloud copy.
@@ -180,19 +194,26 @@ export class CatalogService {
 
   /** Move a catalog into a workspace (or back to personal). Needs delete rights where it is now and edit rights where it goes. */
   async moveToWorkspace(userId: string, id: string, workspaceId: string | null) {
-    const { row } = await requireCatalog(this.db, userId, id, "delete");
     const personal = await ensurePersonalWorkspace(this.db, userId);
     const targetWorkspaceId = workspaceId ?? personal.id;
-    if (targetWorkspaceId) {
-      const role = await workspaceRole(this.db, userId, targetWorkspaceId);
-      if (!role || !ROLE_PERMISSIONS[role].includes("write")) throw new TRPCError({ code: "FORBIDDEN", message: "You can't add catalogs to that workspace" });
-    }
-    const ownerId = targetWorkspaceId === personal.id ? userId : row.ownerId;
-    await this.db.update(catalog).set({ workspaceId: targetWorkspaceId, ownerId }).where(eq(catalog.id, row.id)).catch((e) => {
+    try {
+      return await this.db.transaction(async (tx) => {
+        const [lockedWorkspace] = await tx.select({ id: workspace.id }).from(workspace).where(eq(workspace.id, targetWorkspaceId)).for("update");
+        if (!lockedWorkspace) throw new TRPCError({ code: "NOT_FOUND", message: "Workspace not found." });
+        const transactionalDb = tx as unknown as Database;
+        const { row } = await requireCatalog(transactionalDb, userId, id, "delete", { forUpdate: true });
+        if (row.workspaceId === targetWorkspaceId) return { ok: true };
+        const role = await workspaceRole(transactionalDb, userId, targetWorkspaceId);
+        if (!role || !ROLE_PERMISSIONS[role].includes("write")) throw new TRPCError({ code: "FORBIDDEN", message: "You can't add catalogs to that workspace" });
+        await quotaFor({ db: transactionalDb, platform: this.platform }).assertCanMoveCatalog(userId, row.id, targetWorkspaceId);
+        const ownerId = targetWorkspaceId === personal.id ? userId : row.ownerId;
+        await tx.update(catalog).set({ workspaceId: targetWorkspaceId, ownerId }).where(eq(catalog.id, row.id));
+        return { ok: true };
+      });
+    } catch (e) {
       if (isUniqueViolation(e)) throw new TRPCError({ code: "CONFLICT", message: "You already have a personal copy of this catalog" });
       throw e;
-    });
-    return { ok: true };
+    }
   }
 
   /**
@@ -225,10 +246,25 @@ export class CatalogService {
   }
 
   async delete(userId: string, id: string) {
-    const { row } = await requireCatalog(this.db, userId, id, "delete");
-    const keys = await this.db.select({ storageKey: catalogAsset.storageKey }).from(catalogAsset).where(eq(catalogAsset.catalogId, row.id));
-    await this.db.delete(catalog).where(eq(catalog.id, row.id));
-    return { storageKeys: keys.map((k) => k.storageKey) };
+    const preflight = await requireCatalog(this.db, userId, id, "delete");
+    return this.db.transaction(async (tx) => {
+      if (preflight.row.workspaceId) {
+        const [lockedWorkspace] = await tx.select({ id: workspace.id }).from(workspace)
+          .where(eq(workspace.id, preflight.row.workspaceId)).for("update");
+        if (!lockedWorkspace) throw new TRPCError({ code: "CONFLICT", message: "The workspace changed while deleting this catalog. Try again." });
+      }
+      const { row } = await requireCatalog(tx as unknown as Database, userId, id, "delete", { forUpdate: true });
+      if (row.workspaceId !== preflight.row.workspaceId) throw new TRPCError({ code: "CONFLICT", message: "The catalog moved while deleting it. Try again." });
+      const [activeUpload] = await tx.select({ id: catalogUpload.id }).from(catalogUpload)
+        .where(and(eq(catalogUpload.catalogId, row.id), gt(catalogUpload.expiresAt, new Date()))).limit(1);
+      if (activeUpload) throw new TRPCError({ code: "PRECONDITION_FAILED", message: "A signed asset upload is still active. Wait a few minutes for its upload link to expire, then delete this catalog." });
+      const [assets, uploads] = await Promise.all([
+        tx.select({ storageKey: catalogAsset.storageKey }).from(catalogAsset).where(eq(catalogAsset.catalogId, row.id)),
+        tx.select({ storageKey: catalogUpload.storageKey }).from(catalogUpload).where(eq(catalogUpload.catalogId, row.id)),
+      ]);
+      await tx.delete(catalog).where(eq(catalog.id, row.id));
+      return { storageKeys: [...assets, ...uploads].map((asset) => asset.storageKey) };
+    });
   }
 
   async revisions(userId: string, id: string) {
@@ -241,13 +277,24 @@ export class CatalogService {
   }
 
   /** Access check for uploads (needs edit rights); returns the catalog row and the referenced asset. */
-  async assetTarget(userId: string, id: string, assetId: string) {
-    const found = await requireCatalog(this.db, userId, id, "write").catch(() => null);
+  async assetTarget(userId: string, id: string, assetId: string, options: { forUpdate?: boolean } = {}) {
+    const found = await requireCatalog(this.db, userId, id, "write", options).catch(() => null);
     if (!found) return null;
     const row = found.row;
     const doc = row.document as CatalogDocument;
     const meta = doc.assets?.find((a) => a.id === assetId);
-    return { catalogId: row.id, asset: meta ?? null };
+    return { catalogId: row.id, workspaceId: row.workspaceId, asset: meta ?? null };
+  }
+
+  /** A verified content hash may already be referenced elsewhere in this workspace. */
+  async findWorkspaceAsset(workspaceId: string, hash: string) {
+    const [asset] = await this.db
+      .select({ storageKey: catalogAsset.storageKey, bytes: catalogAsset.bytes, mimeType: catalogAsset.mimeType })
+      .from(catalogAsset)
+      .innerJoin(catalog, eq(catalog.id, catalogAsset.catalogId))
+      .where(and(eq(catalog.workspaceId, workspaceId), eq(catalogAsset.hash, hash)))
+      .limit(1);
+    return asset ?? null;
   }
 
   async recordAsset(input: { catalogId: string; assetId: string; mimeType: string; bytes: number; hash: string; storageKey: string }) {

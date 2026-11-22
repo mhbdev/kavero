@@ -4,6 +4,7 @@ import { protectedProcedure, router } from "../index";
 import { quotaFor } from "../platform/quota";
 import { CatalogService } from "../services/catalog-service";
 import { audit } from "../services/audit-service";
+import { ensurePersonalWorkspace } from "@Kavero/db/personal-workspace";
 
 const id = z.string().min(1).max(100);
 
@@ -19,8 +20,11 @@ export const catalogRouter = router({
       const userId = ctx.session.user.id;
       try {
         const documentId = (input.document as { id?: unknown } | null)?.id;
-        if (typeof documentId === "string") await quotaFor(ctx).assertCanSaveCatalog(userId, documentId);
-        const result = await new CatalogService(ctx.db, ctx.deleteObjects).save(userId, input);
+        if (typeof documentId === "string") {
+          const personal = await ensurePersonalWorkspace(ctx.db, userId);
+          await quotaFor(ctx).assertCanSaveCatalog(userId, input.workspaceId ?? personal.id, documentId);
+        }
+        const result = await new CatalogService(ctx.db, ctx.deleteObjects, ctx.platform).save(userId, input);
         await audit(ctx.db, { userId, action: result.created ? "catalog:create" : "catalog:save", target: result.id, outcome: "ok", details: { revision: result.revision, workspaceId: input.workspaceId ?? null } });
         return result;
       } catch (error) {

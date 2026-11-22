@@ -2,11 +2,13 @@ import { createHash } from "node:crypto";
 
 import { AiCredentialService } from "@Kavero/api/services/ai-credential-service";
 import { CatalogService } from "@Kavero/api/services/catalog-service";
+import { quotaFor } from "@Kavero/api/platform/quota";
 import { MAX_FONT_BYTES, downloadFont, googleFontFaces, sniffFont } from "@Kavero/api/services/font-files";
 import { imageSize } from "@Kavero/api/services/image-size";
 import { fetchImageAsDataUrl } from "@Kavero/api/services/safe-fetch";
 import { audit, isBanned, permissionsToScopes, type ApiKeyPrincipal } from "@Kavero/api/services/audit-service";
 import { user } from "@Kavero/db/schema/auth";
+import type { Database } from "@Kavero/db";
 import { eq } from "drizzle-orm";
 import type { CatalogDocument } from "@Kavero/catalog-engine";
 import { renderPdf, renderSlideImage } from "@Kavero/export-chromium";
@@ -15,7 +17,7 @@ import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/
 import { createResilientRateLimiter, type ResilientRateLimiter } from "@Kavero/redis";
 
 import { renderOrigin } from "@/modules/export/access";
-import { objectStorage } from "@/modules/storage/object-storage";
+import { deleteUnreferencedObjects, objectStorage } from "@/modules/storage/object-storage";
 import { ENV } from "@/env.server";
 import { allowPrivateUrls, platform, runtimeConfig, secretBox, serverAiProvider } from "@/platform";
 import { auth, db } from "@/services";
@@ -28,7 +30,7 @@ const limiters = new Map<number, ResilientRateLimiter>();
 function mcpLimiter(perMinute: number) {
   let limiter = limiters.get(perMinute);
   if (!limiter) {
-    limiter = createResilientRateLimiter({ namespace: `mcp-${perMinute}`, maxRequests: perMinute, windowMs: 60_000 });
+    limiter = createResilientRateLimiter({ namespace: `mcp-${perMinute}`, maxRequests: perMinute, windowMs: 60_000, fallbackMode: platform.edition === "cloud" ? "error" : "local" });
     limiters.set(perMinute, limiter);
   }
   return limiter;
@@ -49,7 +51,15 @@ export async function POST(request: Request) {
   const [owner] = await db.select({ banned: user.banned, banExpires: user.banExpires }).from(user).where(eq(user.id, verified.key.referenceId)).limit(1);
   if (!owner || isBanned(owner)) return unauthorized("Invalid, expired or revoked API key.");
   const perMinute = Number((await runtimeConfig.values("mcp")).requestsPerMinute) || 600;
-  const decision = await mcpLimiter(perMinute).limit(verified.key.id);
+  let decision;
+  try {
+    decision = await mcpLimiter(perMinute).limit(verified.key.id);
+  } catch {
+    return Response.json(
+      { jsonrpc: "2.0", error: { code: -32003, message: "The MCP service is temporarily unavailable. Try again shortly." }, id: null },
+      { status: 503, headers: { "Retry-After": "5" } },
+    );
+  }
   if (!decision.allowed) {
     const retry = Math.max(1, Math.ceil((decision.resetAt.getTime() - Date.now()) / 1000));
     return Response.json(
@@ -69,14 +79,35 @@ export async function POST(request: Request) {
   // Desktop local mode: editor links open in the Kavero app (kavero://), which is signed in.
   const localMode = platform.edition === "desktop";
   const allowLocal = await allowPrivateUrls();
-  const catalogs = new CatalogService(db);
-  /** Store image or font bytes for a cloud catalog; same bytes → same asset id (no duplicates). */
+  const catalogs = new CatalogService(db, undefined, platform);
+  /** Store bytes once per workspace hash and attach the reference to a cloud catalog. */
   const storeImage = async (catalogRowId: string, bytes: Uint8Array, mimeType: string) => {
     const hash = createHash("sha256").update(bytes).digest("hex");
-    const assetId = `ast_${hash.slice(0, 16)}`;
-    const storageKey = `catalogs/${catalogRowId}/${hash}`;
-    await (await objectStorage()).put(storageKey, bytes);
-    await catalogs.recordAsset({ catalogId: catalogRowId, assetId, mimeType, bytes: bytes.byteLength, hash, storageKey });
+    const assetId = `ast_${hash}`;
+    const { row } = await catalogs.access(principal.userId, catalogRowId, "write");
+    if (!row.workspaceId) throw new Error("Move the catalog into a workspace before importing media.");
+    let storageKey = `workspaces/${row.workspaceId}/assets/${hash}`;
+    const storage = await objectStorage();
+    await quotaFor({ db, platform }).reserveStorage(row.workspaceId, bytes.byteLength, async (tx, assertQuota) => {
+      const transactionalDb = tx as unknown as Database;
+      const service = new CatalogService(transactionalDb);
+      const current = await service.access(principal.userId, catalogRowId, "write", { forUpdate: true });
+      if (current.row.workspaceId !== row.workspaceId) throw new Error("The catalog moved while this media import was in progress.");
+      const existing = await service.findWorkspaceAsset(row.workspaceId!, hash);
+      if (existing) {
+        if (existing.bytes !== bytes.byteLength || existing.mimeType !== mimeType) throw new Error("The asset hash matched content with different metadata.");
+        storageKey = existing.storageKey;
+      } else {
+        await assertQuota();
+        try {
+          await storage.putImmutable(storageKey, bytes, mimeType);
+        } catch {
+          const alreadyWritten = await storage.get(storageKey).catch(() => null);
+          if (!alreadyWritten || createHash("sha256").update(alreadyWritten).digest("hex") !== hash) throw new Error("Could not safely write the imported asset to storage.");
+        }
+      }
+      await service.recordAsset({ catalogId: catalogRowId, assetId, mimeType, bytes: bytes.byteLength, hash, storageKey });
+    });
     return { id: assetId, mimeType, bytes: bytes.byteLength, hash, ...(imageSize(bytes) ?? {}) };
   };
   /** The catalog's stored images and fonts as data: URLs (access-checked per file). */
@@ -95,6 +126,7 @@ export async function POST(request: Request) {
     db,
     principal,
     host: {
+      platform,
       publicUrl: (slug) => `${origin}/c/${slug}`,
       editorUrl: (documentId) => (localMode ? `kavero://editor/${encodeURIComponent(documentId)}` : `${origin}/editor/${encodeURIComponent(documentId)}`),
       importImage: async (catalogRowId, url) => {
@@ -119,12 +151,8 @@ export async function POST(request: Request) {
       loadAssets,
       renderPreview: async (doc, slideIndex) => renderSlideImage({ doc, assets: await loadAssets(doc), baseUrl: renderOrigin(request), slideIndex, width: 1280 }),
       renderPdf: async (doc) => renderPdf({ doc, assets: await loadAssets(doc), baseUrl: renderOrigin(request) }),
-      deleteObjects: async (keys) => {
-        // Files are content-addressed per catalog, so these keys belong to the deleted catalog only.
-        const storage = await objectStorage();
-        await Promise.all(keys.map((k) => storage.delete(k)));
-      },
-      ai: (await new AiCredentialService(db, secretBox, { allowLocal, appUrl: ENV.BETTER_AUTH_URL }).provider(principal.userId).catch(() => null)) ?? (await serverAiProvider()),
+      deleteObjects: (keys) => deleteUnreferencedObjects(db, keys),
+      ai: (await new AiCredentialService(db, secretBox, { allowLocal, appUrl: ENV.BETTER_AUTH_URL, requireApiKey: platform.edition === "cloud" }).provider(principal.userId).catch(() => null)) ?? (await serverAiProvider()),
     },
   });
   const transport = new WebStandardStreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });

@@ -16,27 +16,62 @@ export type AuthConfig = {
   BETTER_AUTH_URL: string;
   BETTER_AUTH_SECRET: string;
   REDIS_URL?: string;
+  KAVERO_EDITION?: string;
+  KAVERO_BOOTSTRAP_ADMIN_EMAIL?: string;
+  RESEND_API_KEY?: string;
+  EMAIL_FROM?: string;
 };
+
+async function sendTransactionalEmail(env: AuthConfig, input: { to: string; subject: string; text: string }) {
+  if (!env.RESEND_API_KEY || !env.EMAIL_FROM) throw new Error("Transactional email is not configured (RESEND_API_KEY and EMAIL_FROM are required).");
+  const response = await fetch("https://api.resend.com/emails", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${env.RESEND_API_KEY}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ from: env.EMAIL_FROM, to: [input.to], subject: input.subject, text: input.text }),
+    signal: AbortSignal.timeout(10_000),
+  });
+  if (!response.ok) throw new Error(`Transactional email provider returned HTTP ${response.status}.`);
+}
 
 /** Who may create an account (Admin → Settings). */
 export type SignupPolicy = "open" | "invite-only" | "closed";
 export const SIGNUP_POLICY_KEY = "signup_policy";
 
-export async function getSignupPolicy(database: Database): Promise<SignupPolicy> {
+export async function getSignupPolicy(database: Database, defaultPolicy: SignupPolicy = "open"): Promise<SignupPolicy> {
   const [row] = await database.select({ value: appSetting.value }).from(appSetting).where(eq(appSetting.key, SIGNUP_POLICY_KEY)).limit(1);
   const v = row?.value;
-  return v === "invite-only" || v === "closed" ? v : "open";
+  return v === "open" || v === "invite-only" || v === "closed" ? v : defaultPolicy;
 }
 
 export function createAuth(env: AuthConfig, database: Database) {
-  const secondaryStorage = createBetterAuthSecondaryStorage("better-auth", env.REDIS_URL);
+  const strictRedis = env.KAVERO_EDITION?.trim().toLowerCase() === "cloud";
+  const fallbackMode = strictRedis ? "error" : "local";
+  const secondaryStorage = createBetterAuthSecondaryStorage("better-auth", env.REDIS_URL, fallbackMode);
   return betterAuth({
     database: drizzleAdapter(database, {
       provider: "pg",
       schema,
     }),
     trustedOrigins: [env.BETTER_AUTH_URL],
-    emailAndPassword: { enabled: true },
+    emailAndPassword: {
+      enabled: true,
+      requireEmailVerification: strictRedis,
+      sendResetPassword: async ({ user, url }) => sendTransactionalEmail(env, {
+        to: user.email,
+        subject: "Reset your Kavero password",
+        text: `Use this link to reset your Kavero password. It expires shortly.\n\n${url}\n\nIf you didn't request this, you can ignore this email.`,
+      }),
+    },
+    emailVerification: {
+      sendOnSignUp: strictRedis,
+      sendOnSignIn: strictRedis,
+      autoSignInAfterVerification: false,
+      sendVerificationEmail: async ({ user, url }) => sendTransactionalEmail(env, {
+        to: user.email,
+        subject: "Verify your Kavero email address",
+        text: `Use this link to verify your Kavero email address.\n\n${url}\n\nIf you didn't create this account, you can ignore this email.`,
+      }),
+    },
     secret: env.BETTER_AUTH_SECRET,
     baseURL: env.BETTER_AUTH_URL,
     secondaryStorage,
@@ -46,16 +81,19 @@ export function createAuth(env: AuthConfig, database: Database) {
       enabled: true,
       timeWindow: 60_000,
       maxRequests: 120,
-      customStorage: createBetterAuthRateLimitStorage("better-auth", env.REDIS_URL),
+      customStorage: createBetterAuthRateLimitStorage("better-auth", env.REDIS_URL, fallbackMode),
     },
     databaseHooks: {
       user: {
         create: {
-          // The first account on a new server is its admin; after that the sign-up policy applies.
+          // Only an explicitly configured operator email can receive the initial admin role.
           before: async (user) => {
-            const [{ n } = { n: 0 }] = await database.select({ n: count() }).from(schema.user);
-            if (n === 0) return { data: { ...user, role: "admin" } };
-            const policy = await getSignupPolicy(database);
+            const bootstrapEmail = env.KAVERO_BOOTSTRAP_ADMIN_EMAIL?.trim().toLowerCase();
+            if (bootstrapEmail && user.email.trim().toLowerCase() === bootstrapEmail) {
+              const [{ n } = { n: 0 }] = await database.select({ n: count() }).from(schema.user).where(eq(schema.user.role, "admin"));
+              if (n === 0) return { data: { ...user, role: "admin" } };
+            }
+            const policy = await getSignupPolicy(database, strictRedis ? "closed" : "open");
             if (policy === "closed") {
               throw new APIError("FORBIDDEN", { message: "Sign-ups are closed on this server. Ask an admin for an account." });
             }

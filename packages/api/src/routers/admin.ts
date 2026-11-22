@@ -5,7 +5,8 @@ import { AdminService } from "../services/admin-service";
 import { AUDIT_AREAS, audit } from "../services/audit-service";
 
 const page = z.object({ query: z.string().max(200).optional(), limit: z.number().int().min(1).max(100).default(25), offset: z.number().int().min(0).default(0) });
-const svc = (ctx: { db: ConstructorParameters<typeof AdminService>[0]; session: { user: { id: string } } }) => new AdminService(ctx.db, ctx.session.user.id);
+const svc = (ctx: { db: ConstructorParameters<typeof AdminService>[0]; session: { user: { id: string } }; platform?: { edition: string } }) =>
+  new AdminService(ctx.db, ctx.session.user.id, ctx.platform?.edition === "cloud" ? "closed" : "open");
 
 /** Server administration (Admin page). Admins only. */
 export const adminRouter = router({

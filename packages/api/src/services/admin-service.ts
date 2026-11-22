@@ -19,7 +19,11 @@ const escapeLike = (s: string) => s.replace(/[\\%_]/g, (c) => `\\${c}`);
  * (enforced by adminProcedure) and records what it did in the audit log.
  */
 export class AdminService {
-  constructor(private readonly db: Database, private readonly adminId: string) {}
+  constructor(
+    private readonly db: Database,
+    private readonly adminId: string,
+    private readonly defaultSignupPolicy: SignupPolicy = "open",
+  ) {}
 
   private log(action: string, target: string | null, details?: unknown) {
     return audit(this.db, { userId: this.adminId, action: `admin:${action}`, target, outcome: "ok", details });
@@ -62,7 +66,7 @@ export class AdminService {
         total: count(),
         errors: sql<number>`count(*) filter (where ${aiJob.status} = 'error')`.mapWith(Number),
       }).from(aiJob).where(gte(aiJob.createdAt, since30))),
-      getSignupPolicy(this.db),
+      getSignupPolicy(this.db, this.defaultSignupPolicy),
     ]);
     return {
       users,

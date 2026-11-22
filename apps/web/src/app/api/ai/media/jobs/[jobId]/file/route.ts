@@ -1,7 +1,8 @@
 import { z } from "zod";
 
 import { auth } from "@/services";
-import { getMediaJob, mediaJobFile, readMediaFile } from "@/modules/ai/media-jobs";
+import { getMediaJobForUser, mediaJobFile, readMediaFile } from "@/modules/ai/media-jobs";
+import { objectStorage } from "@/modules/storage/object-storage";
 
 export const runtime = "nodejs";
 export const maxDuration = 150;
@@ -12,18 +13,24 @@ export async function GET(request: Request, context: { params: Promise<{ jobId: 
   if (!session) return Response.json({ error: "Sign in to retrieve this media file." }, { status: 401 });
   const { jobId } = await context.params;
   if (!z.string().uuid().safeParse(jobId).success) return Response.json({ error: "Media job not found." }, { status: 404 });
-  const job = getMediaJob(jobId);
-  if (!job || job.userId !== session.user.id) return Response.json({ error: "Media job not found." }, { status: 404 });
+  const job = await getMediaJobForUser(session.user.id, jobId);
+  if (!job) return Response.json({ error: "Media job not found." }, { status: 404 });
   const requestedFormat = new URL(request.url).searchParams.get("format");
   const format = requestedFormat === "gif" || requestedFormat === "poster" ? requestedFormat : "original";
   try {
     const file = await mediaJobFile(job, format);
-    const data = await readMediaFile(file.file);
+    const storage = await objectStorage();
+    if (await storage.supportsPresignedUrls()) {
+      const url = await storage.presignDownload(file.storageKey, 300);
+      return new Response(null, { status: 302, headers: { Location: url, "Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff" } });
+    }
+    const data = await readMediaFile(file.storageKey);
+    if (!data) return Response.json({ error: "This result is no longer available." }, { status: 404 });
     if (data.byteLength > 25 * 1024 * 1024) return Response.json({ error: "This result exceeds the 25 MB asset limit." }, { status: 413 });
     const extension = format === "gif" ? "gif" : file.mimeType === "image/svg+xml" ? "svg" : file.mimeType.split("/")[1] ?? "bin";
-    return new Response(data, { headers: {
+    return new Response(new Blob([data as BlobPart], { type: file.mimeType }), { headers: {
       "Content-Type": file.mimeType,
-      "Content-Length": String(file.bytes),
+      ...(file.bytes !== null ? { "Content-Length": String(file.bytes) } : {}),
       "Content-Disposition": `inline; filename="generated-${format === "poster" ? "poster" : job.purpose}.${extension}"`,
       "Cache-Control": "private, no-store",
       "X-Content-Type-Options": "nosniff",

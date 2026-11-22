@@ -54,13 +54,13 @@ describe("editions", () => {
 
   test("modules only apply to their editions; entitlements default to unlimited", async () => {
     const selfHosted = new Platform("self-hosted");
-    expect(selfHosted.use({ id: "billing", editions: ["cloud"], entitlements: { forUser: async () => ({ ...UNLIMITED, plan: "Free", maxCatalogs: 3 }) } })).toBe(false);
-    expect(await selfHosted.entitlements.forUser("u")).toEqual(UNLIMITED);
+    expect(selfHosted.use({ id: "billing", editions: ["cloud"], entitlements: { forWorkspace: async () => ({ ...UNLIMITED, plan: "Free", maxCatalogs: 3 }) } })).toBe(false);
+    expect(await selfHosted.entitlements.forWorkspace("w")).toEqual(UNLIMITED);
     expect(selfHosted.features.billing).toBe(false);
 
     const cloud = new Platform("cloud");
-    expect(cloud.use({ id: "billing", editions: ["cloud"], entitlements: { forUser: async () => ({ ...UNLIMITED, plan: "Free", maxCatalogs: 3 }) } })).toBe(true);
-    expect((await cloud.entitlements.forUser("u")).maxCatalogs).toBe(3);
+    expect(cloud.use({ id: "billing", editions: ["cloud"], entitlements: { forWorkspace: async () => ({ ...UNLIMITED, plan: "Free", maxCatalogs: 3 }) } })).toBe(true);
+    expect((await cloud.entitlements.forWorkspace("w")).maxCatalogs).toBe(3);
     expect(() => cloud.use({ id: "billing", editions: ["cloud"] })).toThrow();
   });
 });

@@ -7,6 +7,7 @@
     "build": "bun scripts/build-player.ts && next build",
     "build:player": "bun scripts/build-player.ts",
     "check-types": "tsc --noEmit",
+    "worker": "bun scripts/media-worker.ts",
     "start": "next start",
     "env:generate": "varlock codegen",
     "auth:generate": "varlock run -- bun x auth@latest generate --config src/services.ts --output ../../packages/db/src/schema/auth.ts --yes"
@@ -28,7 +29,9 @@
     "@Kavero/renderer": "workspace:*",
     "@Kavero/ui": "workspace:*",
     "@ai-sdk/react": "^4.0.170",
+    "@aws-sdk/s3-request-presigner": "3.1152.0",
     "@aws-sdk/client-s3": "3.1152.0",
+    "@circulo-ai/upload": "2.0.2",
     "@base-ui/react": "catalog:",
     "@better-auth/api-key": "1.7.12",
     "@electric-sql/pglite": "^0.5.16",

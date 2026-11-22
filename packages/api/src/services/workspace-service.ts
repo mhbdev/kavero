@@ -2,12 +2,15 @@ import { createHash, randomBytes, randomUUID } from "node:crypto";
 
 import type { Database } from "@Kavero/db";
 import { user } from "@Kavero/db/schema/auth";
-import { catalog } from "@Kavero/db/schema/catalog";
+import { catalog, catalogUpload } from "@Kavero/db/schema/catalog";
+import { mediaJob } from "@Kavero/db/schema/integration";
 import { WORKSPACE_ROLES, workspace, workspaceInvite, workspaceMember, type WorkspaceRole } from "@Kavero/db/schema/workspace";
 import { ensurePersonalWorkspace } from "@Kavero/db/personal-workspace";
 import { TRPCError } from "@trpc/server";
 import { and, count, desc, eq, gt, isNotNull, isNull } from "drizzle-orm";
 
+import { quotaFor } from "../platform/quota";
+import type { Platform } from "../platform/edition";
 import { workspaceRole } from "./access";
 
 const hash = (t: string) => createHash("sha256").update(t).digest("hex");
@@ -25,7 +28,11 @@ function editableName(name: string) {
 
 /** Workspaces, members, invitations and roles. */
 export class WorkspaceService {
-  constructor(private readonly db: Database) {}
+  constructor(
+    private readonly db: Database,
+    private readonly platform?: Platform,
+    private readonly deleteObjects?: (keys: string[]) => Promise<void>,
+  ) {}
 
   private async require(userId: string, workspaceId: string, min: WorkspaceRole) {
     const role = await workspaceRole(this.db, userId, workspaceId);
@@ -182,15 +189,46 @@ export class WorkspaceService {
       .from(catalog)
       .where(eq(catalog.workspaceId, workspaceId));
     const personalWorkspaces = await Promise.all(owners.map(({ userId: ownerId }) => ensurePersonalWorkspace(this.db, ownerId)));
-    await this.db.transaction(async (tx) => {
-      for (let i = 0; i < owners.length; i++) {
-        await tx
-          .update(catalog)
-          .set({ workspaceId: personalWorkspaces[i]!.id })
-          .where(and(eq(catalog.workspaceId, workspaceId), eq(catalog.ownerId, owners[i]!.userId)));
+    const personalByOwner = new Map(owners.map(({ userId: ownerId }, index) => [ownerId, personalWorkspaces[index]!.id]));
+    const keysToDelete = await this.db.transaction(async (tx) => {
+      // Asset, publish and transfer paths lock workspace rows before catalog
+      // rows. Use the same order, with stable ids, while returning catalogs to
+      // their owners' Personal workspaces.
+      const workspaceIds = [...new Set([workspaceId, ...personalByOwner.values()])].sort();
+      for (const id of workspaceIds) {
+        const [locked] = await tx.select({ id: workspace.id, personalOwnerId: workspace.personalOwnerId })
+          .from(workspace).where(eq(workspace.id, id)).for("update");
+        if (!locked) throw new TRPCError({ code: "NOT_FOUND", message: "Workspace not found" });
+        if (id === workspaceId && locked.personalOwnerId) throw new TRPCError({ code: "BAD_REQUEST", message: "The Personal workspace is protected and can't be deleted" });
       }
+
+      const [activeUpload] = await tx.select({ id: catalogUpload.id }).from(catalogUpload)
+        .where(and(eq(catalogUpload.workspaceId, workspaceId), gt(catalogUpload.expiresAt, new Date()))).limit(1);
+      if (activeUpload) throw new TRPCError({ code: "PRECONDITION_FAILED", message: "A signed asset upload is still active. Wait a few minutes for its upload link to expire, then delete this workspace." });
+
+      const transactionalDb = tx as unknown as Database;
+      if (await workspaceRole(transactionalDb, userId, workspaceId) !== "owner") {
+        throw new TRPCError({ code: "FORBIDDEN", message: "Only workspace owners can delete a workspace" });
+      }
+      const catalogs = await tx.select({ id: catalog.id, ownerId: catalog.ownerId })
+        .from(catalog).where(eq(catalog.workspaceId, workspaceId)).orderBy(catalog.id).for("update");
+      for (const item of catalogs) {
+        const targetWorkspaceId = personalByOwner.get(item.ownerId);
+        if (!targetWorkspaceId) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: "A catalog owner has no Personal workspace" });
+        await quotaFor({ db: transactionalDb, platform: this.platform }).assertCanMoveCatalog(userId, item.id, targetWorkspaceId);
+        await tx.update(catalog).set({ workspaceId: targetWorkspaceId, ownerId: item.ownerId }).where(eq(catalog.id, item.id));
+      }
+
+      const [uploads, jobs] = await Promise.all([
+        tx.select({ key: catalogUpload.storageKey }).from(catalogUpload).where(eq(catalogUpload.workspaceId, workspaceId)),
+        tx.select({ storageKey: mediaJob.storageKey, posterStorageKey: mediaJob.posterStorageKey, gifStorageKey: mediaJob.gifStorageKey })
+          .from(mediaJob).where(eq(mediaJob.workspaceId, workspaceId)),
+      ]);
       await tx.delete(workspace).where(eq(workspace.id, workspaceId));
+      return [...uploads.map(({ key }) => key), ...jobs.flatMap((job) => [job.storageKey, job.posterStorageKey, job.gifStorageKey])]
+        .filter((key): key is string => !!key);
     });
+    if (keysToDelete.length && this.deleteObjects) await this.deleteObjects(keysToDelete).catch(() => undefined);
     return { ok: true };
   }
 }

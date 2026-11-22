@@ -2,9 +2,11 @@ import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 
 import { ffmpegPath } from "@Kavero/export-chromium";
+import { pingRedis } from "@Kavero/redis";
 import { sql } from "drizzle-orm";
 
 import { objectStorage } from "@/modules/storage/object-storage";
+import { platform } from "@/platform";
 import { db } from "@/services";
 
 import pkg from "../../../../package.json";
@@ -46,19 +48,32 @@ async function checkDb() {
 async function checkStorage() {
   const key = `health/probe-${randomUUID()}`;
   const probe = new Uint8Array([1]);
+  const storage = await objectStorage().catch(() => null);
+  if (!storage) return false;
+  let healthy = false;
   try {
-    const storage = await objectStorage();
     await withTimeout(storage.put(key, probe));
     const read = await withTimeout(storage.get(key));
-    await withTimeout(storage.delete(key));
-    return read?.length === 1 && read[0] === 1;
+    healthy = read?.length === 1 && read[0] === 1;
   } catch {
-    return false;
+    healthy = false;
   }
+  try {
+    await withTimeout(storage.delete(key));
+  } catch {
+    healthy = false;
+  }
+  return healthy;
 }
 
 function checkChrome() {
-  return CHROME_CANDIDATES.some((p) => !!p && existsSync(p));
+  if (CHROME_CANDIDATES.some((p) => !!p && existsSync(p))) return true;
+  if (process.env.VERCEL !== "1") return false;
+  try {
+    return import.meta.resolve("@sparticuz/chromium").startsWith("file:");
+  } catch {
+    return false;
+  }
 }
 
 function checkFfmpeg() {
@@ -69,16 +84,21 @@ function checkFfmpeg() {
   }
 }
 
-/** Liveness/readiness probe. 200 when the database answers, 503 otherwise. Never includes config or secrets. */
+/** Readiness probe. Cloud requires all shared/runtime dependencies; never returns config or secrets. */
 export async function GET() {
-  const [dbOk, storageOk] = await Promise.all([checkDb(), checkStorage()]);
+  const cloud = platform.edition === "cloud";
+  const [dbOk, storageOk, redisOk] = await Promise.all([checkDb(), checkStorage(), pingRedis()]);
+  const chromeOk = checkChrome();
+  const ffmpegOk = checkFfmpeg();
+  const ready = dbOk && (!cloud || (storageOk && redisOk && chromeOk && ffmpegOk));
   const body = {
-    status: dbOk ? (storageOk ? "ok" : "degraded") : "error",
+    status: ready ? "ok" : dbOk ? "degraded" : "error",
     db: dbOk,
     storage: storageOk,
-    chrome: checkChrome(),
-    ffmpeg: checkFfmpeg(),
+    redis: redisOk,
+    chrome: chromeOk,
+    ffmpeg: ffmpegOk,
     version: pkg.version,
   };
-  return Response.json(body, { status: dbOk ? 200 : 503, headers: { "Cache-Control": "no-store" } });
+  return Response.json(body, { status: ready ? 200 : 503, headers: { "Cache-Control": "no-store" } });
 }

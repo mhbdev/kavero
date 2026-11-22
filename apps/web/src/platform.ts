@@ -41,6 +41,8 @@ let ai: { signature: string; provider: LlmProvider | null } | null = null;
 
 /** The server-wide AI model from Admin → System (or AI_* environment variables); null = built-in planner only. */
 export async function serverAiProvider(): Promise<LlmProvider | null> {
+  // Cloud is BYOK-only until provider-funded plans and spend controls ship.
+  if (platform.edition === "cloud") return null;
   const values = await runtimeConfig.values("ai");
   const signature = JSON.stringify(values);
   if (ai?.signature !== signature) ai = { signature, provider: providerFromSettings(values) };
@@ -60,7 +62,20 @@ async function applyExportSettings(config: RuntimeConfig) {
 }
 
 /** Loads admin settings at startup and applies the ones that configure long-lived objects. */
-export async function initPlatform() {
+export async function initPlatform(options: { runtime?: "web" | "worker" } = {}) {
+  if (platform.edition === "cloud") {
+    const missing: string[] = [];
+    if (!ENV.REDIS_URL) missing.push("REDIS_URL (shared rate limits and auth state)");
+    if (!process.env.KAVERO_ENCRYPTION_KEY || process.env.KAVERO_ENCRYPTION_KEY.length < 32) missing.push("KAVERO_ENCRYPTION_KEY (at least 32 characters)");
+    const storage = await runtimeConfig.values("storage");
+    if (storage.driver !== "s3" || typeof storage.bucket !== "string" || !storage.bucket) missing.push("S3 storage (STORAGE_DRIVER=s3 and S3_BUCKET)");
+    if ((options.runtime ?? "web") === "web") {
+      if (!process.env.KAVERO_BOOTSTRAP_ADMIN_EMAIL) missing.push("KAVERO_BOOTSTRAP_ADMIN_EMAIL (initial operator account)");
+      if (!process.env.RESEND_API_KEY) missing.push("RESEND_API_KEY (transactional email)");
+      if (!process.env.EMAIL_FROM) missing.push("EMAIL_FROM (verified sender address)");
+    }
+    if (missing.length) throw new Error(`[kavero] Cloud deployment is missing required configuration: ${missing.join(", ")}`);
+  }
   await runtimeConfig.refresh(true);
   await applyExportSettings(runtimeConfig);
   const box = secretBox.keyId.startsWith("v1") ? " (set KAVERO_ENCRYPTION_KEY to encrypt credentials with a dedicated key)" : "";
